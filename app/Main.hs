@@ -73,7 +73,7 @@ parser = argRead "mode" "Whether to build or to cache (options: Build | Cache)"
 
 main = do
   mode <- options "Builds a docker file and caches its stages" parser -- Parse the CLI arguments as a Mode
-  app <- App <$> needEnv "APP" -- Get the APP environment variable and then wrap it in App
+  app <- App <$> needEnv "APP_NAME" -- Get the APP environment variable and then wrap it in App
   branch <- Branch <$> needEnv "GIT_BRANCH"
   currentDirectory <- pwd
   let file = currentDirectory </> "_infrastructure/Dockerfile"
