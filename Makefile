@@ -1,4 +1,4 @@
-.PHONY: package-linux package-macos publish clean
+.PHONY: publish clean
 
 DOCKER_LINUX_IMAGE="fpco/stack-build:lts-8.18"
 API_HOST=https://api.github.com
@@ -25,7 +25,7 @@ dist-macos/docker-build-cacher:
 	mkdir -p dist-macos
 	stack install --local-bin-path dist-macos
 
-release.json: dist-linux/docker-build-cacher dist-macos/docker-build-cacher:
+release.json: dist-linux/docker-build-cacher dist-macos/docker-build-cacher
 	@echo "Creating draft release for $(VERSION)"
 	@curl $(AUTH) -XPOST $(API_HOST)/repos/seatgeek/docker-build-cacher/releases -d '{ \
 		"tag_name": "$(VERSION)", \
@@ -40,13 +40,13 @@ publish: guard-VERSION guard-GITHUB_TOKEN release.json
 	@sleep 1
 	@echo "Uploading the Linux wrecker-ui"
 	@curl $(AUTH) -XPOST \
-		$(UPLOAD_HOST)/repos/seatgeek/wrecker-ui/releases/$(RELEASE_ID)/assets?name=docker-build-cacher-linux \
+		$(UPLOAD_HOST)/repos/seatgeek/docker-build-cacher/releases/$(RELEASE_ID)/assets?name=docker-build-cacher-linux \
 		-H "Accept: application/vnd.github.manifold-preview" \
 		-H 'Content-Type: application/octet-stream' \
 		--data-binary '@dist-linux/docker-build-cacher' > /dev/null
 	@echo "Uploading the MacOS binary"
 	@curl $(AUTH) -XPOST \
-		$(UPLOAD_HOST)/repos/seatgeek/wrecker-ui/releases/$(RELEASE_ID)/assets?name=docker-build-cacher-macos \
+		$(UPLOAD_HOST)/repos/seatgeek/docker-build-cacher/releases/$(RELEASE_ID)/assets?name=docker-build-cacher-macos \
 		-H "Accept: application/vnd.github.manifold-preview" \
 		-H 'Content-Type: application/octet-stream' \
 		--data-binary '@dist-macos/docker-build-cacher' > /dev/null
