@@ -38,7 +38,7 @@ release.json: dist-linux/docker-build-cacher dist-macos/docker-build-cacher
 publish: guard-VERSION guard-GITHUB_TOKEN release.json
 	$(eval RELEASE_ID := $(shell cat release.json | jq .id))
 	@sleep 1
-	@echo "Uploading the Linux wrecker-ui"
+	@echo "Uploading the Linux docker-build-cacher"
 	@curl $(AUTH) -XPOST \
 		$(UPLOAD_HOST)/repos/seatgeek/docker-build-cacher/releases/$(RELEASE_ID)/assets?name=docker-build-cacher-linux \
 		-H "Accept: application/vnd.github.manifold-preview" \
