@@ -94,7 +94,7 @@ build app branch tag ast = do
   changedStages <- getChangedStages app branch ast -- Inspect the dockerfile and return the stages that got their cache invalidated
   echo "I'll start building now the main Dockerfile"
   let bustedStages = replaceStages (filter alreadyCached changedStages) ast -- We replace the busted stages with cached primed ones
-  status <- buildDockerfile tag bustedStages -- Build the main docker file with the maybe changed stages
+  status <- buildDockerfile app tag bustedStages -- Build the main docker file with the maybe changed stages
   case status of
     ExitSuccess -> do
       echo
@@ -109,7 +109,7 @@ cacheBuild app branch ast = do
   changedStages <- getChangedStages app branch ast
   when (changedStages /= []) $ do
     echo "--> Let's make the cache great again"
-    mapM_ buildAssetStage changedStages -- Build each of the stages so they can be reused later
+    mapM_ (buildAssetStage app) changedStages -- Build each of the stages so they can be reused later
 
 -- | Returns a list of stages which needs to either be built separately or that did not have their cached busted
 --   by the introduction of new code.
@@ -205,15 +205,15 @@ shouldBustCache Cached {..} = do
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image
 --   so we can find it later.
-buildAssetStage :: Stage -> Shell ()
-buildAssetStage Stage {..} = do
+buildAssetStage :: App -> Stage -> Shell ()
+buildAssetStage app Stage {..} = do
   printLn ("\n--> Building asset stage " %s % " at line " %d) stageName stagePos
   let filteredDirectives = filter isFrom directives
-  status <- buildDockerfile stageTag filteredDirectives -- Only build the FROM
+  status <- buildDockerfile app stageTag filteredDirectives -- Only build the FROM
   guard (status == ExitSuccess) -- Break if previous command failed
   onBuildLines <- extractOnBuild stageTag -- We want to preserve the ONBUILD in the new dockerfile
   newDockerfile <- createDockerfile stageTag onBuildLines -- Append the ONBUILD liens to the new file
-  finalStatus <- buildDockerfile (Tag $ taggedBuild stageTag) newDockerfile -- Now build it
+  finalStatus <- buildDockerfile app (Tag $ taggedBuild stageTag) newDockerfile -- Now build it
   guard (finalStatus == ExitSuccess) -- Stop here if previous command failed
   echo ""
   echo "--> I have tagged a cache container that I can use next time to speed builds!"
@@ -222,12 +222,15 @@ buildAssetStage Stage {..} = do
     isFrom _ = False
 
 -- | Simply call docker build for the passed arguments
-buildDockerfile :: Tag -> Dockerfile -> Shell ExitCode
-buildDockerfile (Tag tag) directives = do
+buildDockerfile :: App -> Tag -> Dockerfile -> Shell ExitCode
+buildDockerfile (App app) (Tag tag) directives = do
   currentDirectory <- pwd
   tmpFile <- mktempfile currentDirectory "Dockerfile."
   liftIO $ writeTextFile tmpFile (Text.pack (prettyPrint directives)) -- Put the Dockerfile contents in the tmp file
-  proc "docker" ["build", "-f", format fp tmpFile, "-t", tag, "."] empty -- Build the generated dockerfile
+  proc
+    "docker"
+    ["build", "--build-arg", "APP_NAME=" <> app, "-f", format fp tmpFile, "-t", tag, "."]
+    empty -- Build the generated dockerfile
 
 -- | Given a list of instructions, build a dockerfile where the tag is the FROM for the file and
 --   the list of instructions are wrapped with ONBUILD
