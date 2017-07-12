@@ -75,8 +75,15 @@ main = do
   mode <- options "Builds a docker file and caches its stages" parser -- Parse the CLI arguments as a Mode
   app <- App <$> needEnv "APP_NAME" -- Get the APP environment variable and then wrap it in App
   branch <- Branch <$> needEnv "GIT_BRANCH"
+  maybeFile <-
+    do f <- need "DOCKERFILE" -- Get the dockerfile path if any
+       return (fmap fromText f) -- And transform it to a FilePath
+  --
+  -- if DOCKERFILE is not present, we assume is in the current directory
   currentDirectory <- pwd
-  let file = currentDirectory </> "_infrastructure/Dockerfile"
+  let Just file = maybeFile <|> Just (currentDirectory </> "Dockerfile")
+  --
+  -- Now we try to parse the dockefile
   dockerFile <- parseFile (Text.unpack $ format fp file) -- Convert the dockerfile to an AST
   case dockerFile of
     Left message -> error ("There was an error parsing the docker file: " <> show message)

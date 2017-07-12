@@ -90,6 +90,13 @@ docker-build-cacher Build # This will build the docker file
 docker-build-cacher Cache # This will cache each of the stage results separately
 ```
 
+Additionally, `docker-build-cacher` accepts the `DOCKERFILE` env variable in case the file is not present in the
+current directory:
+
+```bash
+DOCKERFILE=buildfiles/Dockerfile docker-build-cacher Build
+```
+
 At the end of the process you can call `docker images` and see that it has created `fancyapp:latest`, and if you are using
 multi-stage builds, it should have created an image tag for each of the stages in your Dockerfile
 
