@@ -20,8 +20,8 @@ WORKDIR /app
 
 # Whenever this image is used execute these triggers
 ONBUILD ADD package.json yarn.lock .
-ONBUILD yarn
-ONBUILD yarn run dist
+ONBUILD RUN yarn
+ONBUILD RUN yarn run dist
 ```
 
 And then you call
