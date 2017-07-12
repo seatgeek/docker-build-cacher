@@ -159,7 +159,7 @@ inspectCache stage@(Stage {..}) = do
     True -> do
       onBuildLines <- extractOnBuild (Tag $ taggedBuild stageTag)
       let parsedDirectivesWithErrors = fmap (parseString . Text.unpack) onBuildLines -- Parse each of the lines
-          parsedDirectives = head . rights $ parsedDirectivesWithErrors -- We only keep the good lines
+          parsedDirectives = getFirst . rights $ parsedDirectivesWithErrors -- We only keep the good lines
           cachePaths = extractCachePaths parsedDirectives
           cacheBusters = fmap fromText cachePaths
       return $ Cached {..}
@@ -171,6 +171,8 @@ inspectCache stage@(Stage {..}) = do
     explodeAndDropLast t =
       let _:rest = reverse (fmap Text.strip (Text.splitOn " " . Text.pack $ t))
       in reverse rest
+    getFirst (first:_) = first
+    getFirst [] = []
 
 -- | Here check each of the cache buster from the image and compare them with those we have locally,
 --   if the files do not match, then we return the stage back as a result, otherwise return Nothing.
