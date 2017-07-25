@@ -14,10 +14,10 @@
 module Main where
 
 import qualified Control.Foldl as Fold
-import Control.Monad (when, guard)
+import Control.Monad (guard, when)
 import Data.Either (rights)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (mapMaybe, catMaybes, isJust)
+import Data.Maybe (catMaybes, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Filesystem.Path (FilePath)
@@ -43,6 +43,14 @@ newtype Tag =
   Tag Text
   deriving (Show, Eq)
 
+newtype SourcePath =
+  SourcePath FilePath
+  deriving (Show, Eq)
+
+newtype TargetPath =
+  TargetPath FilePath
+  deriving (Show, Eq)
+
 -- | A Stage is one of the FROM directives ina dockerfile
 --
 data Stage = Stage
@@ -57,8 +65,8 @@ data Stage = Stage
 data InspectedStage
   = NotCached Stage -- When the image has not yet been built separetely
   | Cached { stage :: Stage -- When the image was built and tagged as a separate image
-          ,  cacheBusters :: [FilePath] -- List of files that are able to bust the cache
-           }
+           , cacheBusters :: [(SourcePath, TargetPath)] -- List of files that are able to bust the cache
+            }
   deriving (Show)
 
 -- | This script has 2 modes. One for building the Dockerfile, and another for caching its stages
@@ -84,7 +92,7 @@ main = do
   let Just file = maybeFile <|> Just (currentDirectory </> "Dockerfile")
   --
   -- Now we try to parse the dockefile
-  dockerFile <- parseFile (Text.unpack $ format fp file) -- Convert the dockerfile to an AST
+  dockerFile <- parseFile (Text.unpack (format fp file)) -- Convert the dockerfile to an AST
   case dockerFile of
     Left message -> error ("There was an error parsing the docker file: " <> show message)
     Right ast ->
@@ -164,20 +172,34 @@ inspectCache stage@(Stage {..}) = do
   case alreadyCached of
     False -> return (NotCached stage)
     True -> do
-      onBuildLines <- extractOnBuild (Tag $ taggedBuild stageTag)
-      let parsedDirectivesWithErrors = fmap (parseString . Text.unpack) onBuildLines -- Parse each of the lines
-          parsedDirectives = getFirst . rights $ parsedDirectivesWithErrors -- We only keep the good lines
-          cachePaths = extractCachePaths parsedDirectives
-          cacheBusters = fmap fromText cachePaths
-      return $ Cached {..}
+      history <- imageHistory (Tag (taggedBuild stageTag))
+      let onBuildLines = extractOnBuild history
+          workdir = extractWorkdir history
+          parsedDirectivesWithErrors = fmap (parseString . Text.unpack) onBuildLines -- Parse each of the lines
+          parsedDirectives = (getFirst . rights) parsedDirectivesWithErrors -- We only keep the good lines
+          cacheBusters = extractCachePaths workdir parsedDirectives
+      return (Cached {..})
   where
-    extractCachePaths dir = concat (mapMaybe doExtract dir)
-    doExtract (InstructionPos (Copy fr t) _ _) = Just ((Text.pack fr) : explodeAndDropLast t) -- Make sure we get all the files in COPY
-    doExtract (InstructionPos (Add fr _) _ _) = Just [Text.pack fr] -- The source path is the cache buster
+    extractCachePaths workdir dir =
+      let filePairs = concat (mapMaybe doExtract dir) -- Get the (source, target) pairs of files copied
+      in fmap (prependWorkdir workdir) filePairs -- Some target paths need to have the WORKDIR prepended
+    --
+    -- | Prepend a given target dir to the target path
+    prependWorkdir workdir (source, TargetPath target) =
+      if relative target -- If the target path is relative, we need to prepend the workdir
+        then (source, TargetPath (collapse (workdir </> target))) -- Remove the ./ prefix and prepend workdir
+        else (source, TargetPath target)
+    --
+    -- | COPY allows multiple paths in the same line, we need to convert each to a separate path
+    doExtract (InstructionPos (Copy fr t) _ _) =
+      let target:allSources = (reverse . Text.words . Text.pack) t -- Make sure we get all the files in COPY
+          sourcePaths = fmap toSource allSources
+      in Just (zip sourcePaths (repeat (toTarget target)))
+    --
+    -- | This case is simpler, we only need to convert the source and target from ADD
+    doExtract (InstructionPos (Add fr t) _ _) =
+      Just [((toSource . Text.pack) fr, (toTarget . Text.pack) t)]
     doExtract _ = Nothing
-    explodeAndDropLast t =
-      let _:rest = reverse (fmap Text.strip (Text.splitOn " " . Text.pack $ t))
-      in reverse rest
     getFirst (first:_) = first
     getFirst [] = []
 
@@ -188,6 +210,7 @@ shouldBustCache (NotCached stage) = return (Just stage)
 shouldBustCache Cached {..} = do
   printLn ("----> Checking cache buster files for stage " %s) (stageName stage)
   containerId <- inproc "docker" ["create", (taggedBuild (stageTag stage))] empty
+  -- Get the cache buster files that have changed since last time
   hasChanged <- fold (mfilter isJust (checkFileChanged containerId cacheBusters)) Fold.head
   if isJust hasChanged
     then do
@@ -198,15 +221,16 @@ shouldBustCache Cached {..} = do
       return Nothing
   where
     checkFileChanged containerId files = do
-      file <- select files
-      printLn ("------> Checking file " %fp) file
+      (SourcePath file, TargetPath targetDir) <- select files
+      printLn ("------> Checking file '" %fp % "' in directory " %fp) file targetDir
       currentDirectory <- pwd
       tempFile <- mktempfile currentDirectory "comp"
+      let targetFile = targetDir </> file
       status <-
-        proc "docker" ["cp", format (l % ":/app/" %fp) containerId file, format fp tempFile] empty
+        proc "docker" ["cp", format (l % ":" %fp) containerId targetFile, format fp tempFile] empty
       guard (status == ExitSuccess)
-      local <- liftIO $ readTextFile file
-      remote <- liftIO $ readTextFile tempFile
+      local <- liftIO (readTextFile file)
+      remote <- liftIO (readTextFile tempFile)
       if local == remote
         then return Nothing
         else return (Just file)
@@ -220,9 +244,9 @@ buildAssetStage app Stage {..} = do
   let filteredDirectives = filter isFrom directives
   status <- buildDockerfile app stageTag filteredDirectives -- Only build the FROM
   guard (status == ExitSuccess) -- Break if previous command failed
-  onBuildLines <- extractOnBuild stageTag -- We want to preserve the ONBUILD in the new dockerfile
-  newDockerfile <- createDockerfile stageTag onBuildLines -- Append the ONBUILD liens to the new file
-  finalStatus <- buildDockerfile app (Tag $ taggedBuild stageTag) newDockerfile -- Now build it
+  history <- imageHistory stageTag -- Get the commands used to build the docker image
+  newDockerfile <- createDockerfile stageTag (extractOnBuild history) -- Append the ONBUILD lines to the new file
+  finalStatus <- buildDockerfile app (Tag (taggedBuild stageTag)) newDockerfile -- Now build it
   guard (finalStatus == ExitSuccess) -- Stop here if previous command failed
   echo ""
   echo "--> I have tagged a cache container that I can use next time to speed builds!"
@@ -235,7 +259,7 @@ buildDockerfile :: App -> Tag -> Dockerfile -> Shell ExitCode
 buildDockerfile (App app) (Tag tag) directives = do
   currentDirectory <- pwd
   tmpFile <- mktempfile currentDirectory "Dockerfile."
-  liftIO $ writeTextFile tmpFile (Text.pack (prettyPrint directives)) -- Put the Dockerfile contents in the tmp file
+  liftIO (writeTextFile tmpFile (Text.pack (prettyPrint directives))) -- Put the Dockerfile contents in the tmp file
   proc
     "docker"
     ["build", "--build-arg", "APP_NAME=" <> app, "-f", format fp tmpFile, "-t", tag, "."]
@@ -255,12 +279,9 @@ createDockerfile (Tag tag) onBuildLines = do
     toInstruction [(InstructionPos inst _ _)] = inst
     toInstruction _ = error "This is not possible"
 
--- | Extracts the list of instructions appearing in ONBUILD for a given docker image tag
-extractOnBuild :: Tag -> Shell [Text]
-extractOnBuild (Tag tag) = do
-  printLn ("----> Checking the docker image history for " %s) tag
-  out <- fold (imageHistory tag) Fold.list -- Buffer all the output of the imageHistory shell
-  return (reverse (doExtract out)) -- The history comes in reverse order, sort it naturally
+-- | Extracts the list of instructions appearing in ONBUILD for a given docker history for a tag
+extractOnBuild :: [Line] -> [Text]
+extractOnBuild lines = doExtract lines
   where
     onBuildPrefix = "/bin/sh -c #(nop)  ONBUILD "
     --
@@ -273,10 +294,32 @@ extractOnBuild (Tag tag) = do
     findOnBuildLines = takeWhile isOnBuild . dropWhile (not . isOnBuild)
     isOnBuild line = Text.isPrefixOf onBuildPrefix (lineToText line)
 
--- | Calls docker history for the given image name
-imageHistory :: Text -> Shell Line
-imageHistory tag =
-  inproc "docker" ["history", "--no-trunc", "--format", "{{.CreatedBy}}", tag] empty
+extractWorkdir :: [Line] -> FilePath
+extractWorkdir lines =
+  case reverse (doExtract lines) of
+    [] -> fromText "/"
+    lastWorkdir:_ -> fromText lastWorkdir -- We are on;y intereted in the latest WORKDIR declared
+  where
+    onBuildPrefix = "/bin/sh -c #(nop)  ONBUILD " -- Curiously, ONBUILD is lead by 2 spaces
+    workdirPrefix = "/bin/sh -c #(nop) WORKDIR " -- Whereas WORKDIR only by one space
+    --
+    -- | First find all relevant lines, then kepp the lines starting with the workdir prefix
+    doExtract = mapMaybe (Text.stripPrefix workdirPrefix . lineToText) . findRelevantLines
+    --
+    -- | Take lines until a ONBUILD is found
+    --   Arguments flow from right to left in the functions chain
+    findRelevantLines = takeWhile (not . isOnBuild)
+    isOnBuild line = Text.isPrefixOf onBuildPrefix (lineToText line)
+
+-- | Calls docker history for the given image name and returns the output as a list
+imageHistory :: Tag -> Shell [Line]
+imageHistory (Tag tag) = do
+  printLn ("----> Checking the docker image history for " %s) tag
+  out <- fold fetchHistory Fold.list -- Buffer all the output of the imageHistory shell
+  return (reverse out) -- The history comes in reverse order, sort it naturally
+  where
+    fetchHistory =
+      inproc "docker" ["history", "--no-trunc", "--format", "{{.CreatedBy}}", tag] empty
 
 --
 -- | Returns a list of directives grouped by the appeareance of the FROM directive
@@ -341,6 +384,12 @@ replaceStages stages dockerLines = fmap replaceStage dockerLines
     formatAlias alias = "latest as " <> Text.unpack alias
 
 printLn message = printf (message % "\n")
+
+-- | Transforms a text to SourcePath
+toSource = SourcePath . fromText
+
+-- | Transforms a text to TargetPath
+toTarget = TargetPath . fromText
 
 needEnv varName = do
   value <- need varName
