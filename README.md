@@ -86,15 +86,15 @@ export APP_NAME=fancyapp
 export GIT_BRANCH=master
 export DOCKER_TAG=fancyapp:latest
 
-docker-build-cacher Build # This will build the docker file
-docker-build-cacher Cache # This will cache each of the stage results separately
+docker-build-cacher build # This will build the docker file
+docker-build-cacher cache # This will cache each of the stage results separately
 ```
 
 Additionally, `docker-build-cacher` accepts the `DOCKERFILE` env variable in case the file is not present in the
 current directory:
 
 ```bash
-DOCKERFILE=buildfiles/Dockerfile docker-build-cacher Build
+DOCKERFILE=buildfiles/Dockerfile docker-build-cacher build
 ```
 
 At the end of the process you can call `docker images` and see that it has created `fancyapp:latest`, and if you are using

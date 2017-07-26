@@ -23,6 +23,8 @@ import Data.Text (Text)
 import Filesystem.Path (FilePath)
 import Language.Dockerfile hiding (Tag)
 import Prelude hiding (FilePath)
+import Text.Read
+import Text.ParserCombinators.ReadP hiding (choice)
 import Turtle
 
 {- Glossary:
@@ -73,11 +75,23 @@ data InspectedStage
 data Mode
   = Build
   | Cache
-  deriving (Read, Show)
+  deriving (Show)
+
+instance Read Mode where
+  readPrec =
+    Text.Read.choice $
+    strValMap
+      [ ("Build", Build) -- Accept both casings
+      , ("build", Build)
+      , ("Cache", Cache)
+      , ("cache", Cache)
+      ]
+    where
+      strValMap = map (\(x, y) -> lift $ string x >> return y)
 
 -- | Describes the arguments this script takes from the command line
 parser :: Parser Mode
-parser = argRead "mode" "Whether to build or to cache (options: Build | Cache)"
+parser = argRead "mode" "Whether to build or to cache (options: build | cache)"
 
 main = do
   mode <- options "Builds a docker file and caches its stages" parser -- Parse the CLI arguments as a Mode
