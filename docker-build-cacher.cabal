@@ -1,12 +1,13 @@
 name:                docker-build-cacher
 version:             1.0
--- synopsis:
--- description:
+synopsis:            Builds a services with docker and caches all of its intermediate stages
+description:         A CLI tool to speed up multi-stage docker file builds by caching intermediate
+                     stages separately, so the can be used in successive builds.
 license:             BSD3
 license-file:        LICENSE
 author:              Jose Lorenzo Rodriguez
 maintainer:          lorenzo@seatgeek.com
-copyright:           2017 Jose Lorenzo Rodriguez
+copyright:           2017 Seatgeek
 category:            Operations
 build-type:          Simple
 extra-source-files:  README.md
@@ -16,7 +17,7 @@ executable docker-build-cacher
   hs-source-dirs:      app
   main-is:             Main.hs
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
-  build-depends:       base
+  build-depends:       base >= 2 && < 4
                      , turtle
                      , language-dockerfile
                      , containers
