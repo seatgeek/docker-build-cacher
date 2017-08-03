@@ -367,7 +367,7 @@ toStage (App app) (Branch branch) directives = do
   where
     getStageInfo :: [InstructionPos] -> Maybe (Text, Linenumber, Text)
     getStageInfo ((InstructionPos (From (TaggedImage name tag)) _ pos):_) =
-        if Text.isInfixOf " as " (Text.pack tag) -- Make sure the FROM is aliased
+        if Text.isInfixOf " as " (Text.pack tag) || Text.isInfixOf " AS " (Text.pack tag) -- Make sure the FROM is aliased
             then Just (Text.pack name, pos, parseAlias tag)
             else Nothing
     getStageInfo _ = Nothing
@@ -377,7 +377,13 @@ toStage (App app) (Branch branch) directives = do
 
 -- | Extracts the stage alias out of the FROM directive
 parseAlias :: String -> Text
-parseAlias = Text.strip . Text.replace "as " "" . snd . Text.breakOn " as " . Text.pack
+parseAlias =
+    Text.strip .
+    Text.replace "as " "" . -- Remove the alias
+    snd .
+    Text.breakOn " as " . -- Split by the alias name and get the second in the tuple
+    Text.replace " AS " " as " . -- Normalize AS with as
+    Text.pack
 
 taggedBuild :: Tag -> Text
 taggedBuild (Tag tag) = tag <> "-build"
