@@ -282,7 +282,16 @@ buildDockerfile (App app) (Tag tag) directives = do
     liftIO (writeTextFile tmpFile (Text.pack (prettyPrint directives))) -- Put the Dockerfile contents in the tmp file
     proc
         "docker"
-        ["build", "--build-arg", "APP_NAME=" <> app, "-f", format fp tmpFile, "-t", tag, "."]
+        [ "build"
+        , "--pull"
+        , "--build-arg"
+        , "APP_NAME=" <> app
+        , "-f"
+        , format fp tmpFile
+        , "-t"
+        , tag
+        , "."
+        ]
         empty -- Build the generated dockerfile
 
 -- | Given a list of instructions, build a dockerfile where the tag is the FROM for the file and
