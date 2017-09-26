@@ -125,11 +125,10 @@ build app branch tag ast = do
     let bustedStages = replaceStages (filter alreadyCached changedStages) ast -- We replace the busted stages with cached primed ones
     status <- buildDockerfile app tag bustedStages -- Build the main docker file with the maybe changed stages
     case status of
-        ExitSuccess -> do
+        ExitSuccess ->
             echo
                 "I built the main dockerfile without a problem. Now call this same script with the `Cache` mode"
-        ExitFailure _ -> do
-            die "Boo, I could not build the project"
+        ExitFailure _ -> die "Boo, I could not build the project"
 
 -- | One a dockefile is built, we can extrac each of the stages separately and then tag them, so the cache
 --   can be retreived at a later point.
@@ -226,17 +225,20 @@ shouldBustCache :: InspectedStage -> Shell (Maybe Stage)
 shouldBustCache (NotCached stage) = return (Just stage)
 shouldBustCache Cached {..} = do
     printLn ("----> Checking cache buster files for stage " %s) (stageName stage)
-    containerId <- inproc "docker" ["create", (taggedBuild (stageTag stage))] empty
-  -- Get the cache buster files that have changed since last time
-    hasChanged <- fold (mfilter isJust (checkFileChanged containerId cacheBusters)) Fold.head
-    if isJust hasChanged
-        then do
-            printLn ("----> The stage " %s % " changed") (stageName stage)
-            return (Just stage)
-        else do
-            printLn ("----> The stage " %s % " did not change") (stageName stage)
-            return Nothing
+    withContainer stage checkFiles -- Create a container to inspect the files
   where
+    checkFiles containerId = do
+        hasChanged <- fold (mfilter isJust (checkFileChanged containerId cacheBusters)) Fold.head
+        -- ^ Get the cache buster files that have changed since last time
+        -- The following is executed for each of the files found
+        if isJust hasChanged
+            then do
+                printLn ("----> The stage " %s % " changed") (stageName stage)
+                return (Just stage)
+            else do
+                printLn ("----> The stage " %s % " did not change") (stageName stage)
+                return Nothing
+    -- |
     checkFileChanged containerId files = do
         (SourcePath file, TargetPath targetDir) <- select files
         printLn ("------> Checking file '" %fp % "' in directory " %fp) file targetDir
@@ -246,7 +248,7 @@ shouldBustCache Cached {..} = do
         status <-
             proc
                 "docker"
-                ["cp", format (l % ":" %fp) containerId targetFile, format fp tempFile]
+                ["cp", format (s % ":" %fp) containerId targetFile, format fp tempFile]
                 empty
         guard (status == ExitSuccess)
         local <- liftIO (readTextFile file)
@@ -254,6 +256,18 @@ shouldBustCache Cached {..} = do
         if local == remote
             then return Nothing
             else return (Just file)
+
+-- | Creates a container from a stage and passes the container id to the
+--   given shell as an argument
+withContainer :: Stage -> (Text -> Shell b) -> Shell b
+withContainer stage action = do
+    containerId <- inproc "docker" ["create", taggedBuild (stageTag stage)] empty
+    result <- fold (action (format l containerId)) Fold.list
+    removeContainer containerId
+    select result -- yield each result as a separate line
+  where
+    removeContainer containerId =
+        proc "docker" ["rm", format l containerId] empty
 
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image
@@ -325,15 +339,15 @@ extractOnBuild lines = doExtract lines
     isOnBuild line = Text.isPrefixOf onBuildPrefix (lineToText line)
 
 extractWorkdir :: [Line] -> FilePath
-extractWorkdir lines =
-    case reverse (doExtract lines) of
+extractWorkdir instructions =
+    case reverse (doExtract instructions) of
         [] -> fromText "/"
         lastWorkdir:_ -> fromText lastWorkdir -- We are on;y intereted in the latest WORKDIR declared
   where
     onBuildPrefix = "/bin/sh -c #(nop)  ONBUILD " -- Curiously, ONBUILD is lead by 2 spaces
     workdirPrefix = "/bin/sh -c #(nop) WORKDIR " -- Whereas WORKDIR only by one space
     --
-    -- | First find all relevant lines, then kepp the lines starting with the workdir prefix
+    -- | First find all relevant instructions, then keep the lines starting with the workdir prefix
     doExtract = mapMaybe (Text.stripPrefix workdirPrefix . lineToText) . findRelevantLines
     --
     -- | Take lines until a ONBUILD is found
