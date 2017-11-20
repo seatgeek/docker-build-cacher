@@ -266,8 +266,7 @@ withContainer stage action = do
     removeContainer containerId
     select result -- yield each result as a separate line
   where
-    removeContainer containerId =
-        proc "docker" ["rm", format l containerId] empty
+    removeContainer containerId = proc "docker" ["rm", format l containerId] empty
 
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image

@@ -1,6 +1,6 @@
 .PHONY: publish clean
 
-DOCKER_LINUX_IMAGE="fpco/stack-build:lts-9.1"
+DOCKER_LINUX_IMAGE="fpco/stack-build:lts-9.13"
 API_HOST=https://api.github.com
 UPLOAD_HOST=https://uploads.github.com
 DASH_VERSION=$(shell echo $(VERSION) | sed -e s/\\./-/g)
@@ -20,10 +20,12 @@ guard-%:
 dist-linux/docker-build-cacher:
 	mkdir -p dist-linux
 	stack --docker --docker-auto-pull --docker-image $(DOCKER_LINUX_IMAGE) install --local-bin-path dist-linux
+	upx --best dist-linux/docker-build-cacher
 
 dist-macos/docker-build-cacher:
 	mkdir -p dist-macos
 	stack install --local-bin-path dist-macos
+	upx --best dist-macos/docker-build-cacher
 
 release.json: dist-linux/docker-build-cacher dist-macos/docker-build-cacher
 	@echo "Creating draft release for $(VERSION)"
