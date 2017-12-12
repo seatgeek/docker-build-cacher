@@ -111,6 +111,15 @@ of the original base image.
 
 The effect this `FROM` swap has, is that disk state for the image is preserved between builds.
 
+## Passing extra arguments to docker build
+
+It is possible to pass extra arguments and flags to the `docker build` step by providing the environment variable `DOCKER_BUILD_OPTIONS` as
+shown below:
+
+
+```bash
+DOCKER_BUILD_OPTIONS="--build-arg foo=bar --quiet" docker-build-cacher build
+```
 
 ## Building from source
 

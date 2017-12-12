@@ -1,7 +1,7 @@
 #!/usr/bin/env stack
 {- stack
   runghc
-  --resolver lts-8.18
+  --resolver lts-9.14
   --install-ghc
   --package turtle
   --package language-dockerfile
@@ -17,7 +17,7 @@ import qualified Control.Foldl as Fold
 import Control.Monad (guard, when)
 import Data.Either (rights)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Filesystem.Path (FilePath)
@@ -52,6 +52,10 @@ newtype SourcePath =
 newtype TargetPath =
     TargetPath FilePath
     deriving (Show, Eq)
+
+newtype BuildOptions =
+    BuildOptions Text
+    deriving (Show)
 
 -- | A Stage is one of the FROM directives ina dockerfile
 --
@@ -89,17 +93,32 @@ instance Read Mode where
       where
         strValMap = map (\(x, y) -> lift $ string x >> return y)
 
--- | Describes the arguments this script takes from the command line
-parser :: Parser Mode
-parser = argRead "mode" "Whether to build or to cache (options: build | cache)"
+data Args = Args
+    { mode :: Mode
+    , noCacheStages :: Bool
+    , noBuildCache :: Bool
+    }
 
+-- | Describes the arguments this script takes from the command line
+parser :: Parser Args
+parser =
+    Args <$> -- Pass the parsed arguments into the Args data container
+    argRead "mode" "Whether to build or to cache (options: build | cache)" <*>
+    switch
+        "no-cache-stages"
+        's'
+        "Each of the FROM instruction will be cached in separate images if this flag is not set" <*>
+    switch "no-cache-build" 'n' "Skip the internal docker cache when building the image"
+
+main :: IO ()
 main = do
-    mode <- options "Builds a docker file and caches its stages" parser -- Parse the CLI arguments as a Mode
+    Args {mode, noCacheStages, noBuildCache} <-
+        options "Builds a docker file and caches its stages" parser -- Parse the CLI arguments as a Mode
     app <- App <$> needEnv "APP_NAME" -- Get the APP environment variable and then wrap it in App
     branch <- Branch <$> needEnv "GIT_BRANCH"
     maybeFile <-
-        do f <- need "DOCKERFILE" -- Get the dockerfile path if any
-           return (fmap fromText f) -- And transform it to a FilePath
+        do file <- need "DOCKERFILE" -- Get the dockerfile path if any
+           return (fmap fromText file) -- And transform it to a FilePath
   --
   -- if DOCKERFILE is not present, we assume is in the current directory
     currentDirectory <- pwd
@@ -111,19 +130,35 @@ main = do
         Left message -> error ("There was an error parsing the docker file: " <> show message)
         Right ast ->
             case mode of
-                Cache -> sh (cacheBuild app branch ast)
+                Cache ->
+                    if noCacheStages
+                        then echo "Skipping... I was told not to cache any stages separetely"
+                        else sh (cacheBuild app branch ast)
                 Build -> do
                     tag <- Tag <$> needEnv "DOCKER_TAG"
-                    sh (build app branch tag ast)
+                    buildOPtions <-
+                        do opts <- need "DOCKER_BUILD_OPTIONS"
+                           if noBuildCache
+                               then return $
+                                    Just (opts & fromMaybe "" & (<> " --no-cache") & BuildOptions) -- Append the docker --no-cache option
+                               else return (fmap BuildOptions opts)
+                    if noCacheStages
+                        then sh (build app tag buildOPtions ast)
+                        else sh (buildFromCache app branch tag buildOPtions ast)
 
 -- | Builds the provided Dockerfile. If it is a multi-stage build, check if those stages are already cached
 --   and change the dockerfile to take advantage of that.
-build :: App -> Branch -> Tag -> Dockerfile -> Shell ()
-build app branch tag ast = do
+buildFromCache :: App -> Branch -> Tag -> Maybe BuildOptions -> Dockerfile -> Shell ()
+buildFromCache app branch tag buildOptions ast = do
+    liftIO . print $ buildOptions
     changedStages <- getChangedStages app branch ast -- Inspect the dockerfile and return the stages that got their cache invalidated
-    echo "I'll start building now the main Dockerfile"
     let bustedStages = replaceStages (filter alreadyCached changedStages) ast -- We replace the busted stages with cached primed ones
-    status <- buildDockerfile app tag bustedStages -- Build the main docker file with the maybe changed stages
+    build app tag buildOptions bustedStages
+
+build :: App -> Tag -> Maybe BuildOptions -> Dockerfile -> Shell ()
+build app tag buildOptions ast = do
+    echo "I'll start building now the main Dockerfile"
+    status <- buildDockerfile app tag buildOptions ast -- Build the main docker file with the maybe changed stages
     case status of
         ExitSuccess ->
             echo
@@ -164,7 +199,7 @@ getChangedStages app branch ast = do
 getAlreadyCached :: [Stage] -> Shell Stage
 getAlreadyCached stages = do
     echo "--> I'm checking whether or not the stage exists as a docker image already"
-    stage@(Stage {stageTag}) <- select stages -- foreach stages as stage
+    stage@Stage {stageTag} <- select stages -- foreach stages as stage
     printLn ("----> Looking for image " %s) (taggedBuild stageTag)
     existent <-
         fold
@@ -184,17 +219,17 @@ getAlreadyCached stages = do
 -- | This will inspect how an image was build and extrack the ONBUILD directives. If any of those
 --   instructions are copying or adding files to the build, they are considered "cache busters".
 inspectCache :: Stage -> Shell InspectedStage
-inspectCache stage@(Stage {..}) = do
-    case alreadyCached of
-        False -> return (NotCached stage)
-        True -> do
+inspectCache stage@Stage {..} =
+    if alreadyCached
+        then return (NotCached stage)
+        else do
             history <- imageHistory (Tag (taggedBuild stageTag))
             let onBuildLines = extractOnBuild history
                 workdir = extractWorkdir history
                 parsedDirectivesWithErrors = fmap (parseString . Text.unpack) onBuildLines -- Parse each of the lines
                 parsedDirectives = (getFirst . rights) parsedDirectivesWithErrors -- We only keep the good lines
                 cacheBusters = extractCachePaths workdir parsedDirectives
-            return (Cached {..})
+            return Cached {..}
   where
     extractCachePaths workdir dir =
         let filePairs = concat (mapMaybe doExtract dir) -- Get the (source, target) pairs of files copied
@@ -207,7 +242,7 @@ inspectCache stage@(Stage {..}) = do
             else (source, TargetPath target)
     --
     -- | COPY allows multiple paths in the same line, we need to convert each to a separate path
-    doExtract (InstructionPos (Copy fr t) _ _) =
+    doExtract (InstructionPos (Copy _ t) _ _) =
         let target:allSources = (reverse . Text.words . Text.pack) t -- Make sure we get all the files in COPY
             sourcePaths = fmap toSource allSources
         in Just (zip sourcePaths (repeat (toTarget target)))
@@ -263,7 +298,7 @@ withContainer :: Stage -> (Text -> Shell b) -> Shell b
 withContainer stage action = do
     containerId <- inproc "docker" ["create", taggedBuild (stageTag stage)] empty
     result <- fold (action (format l containerId)) Fold.list
-    removeContainer containerId
+    _ <- removeContainer containerId -- Ignore the return code of this command
     select result -- yield each result as a separate line
   where
     removeContainer containerId = proc "docker" ["rm", format l containerId] empty
@@ -275,11 +310,11 @@ buildAssetStage :: App -> Stage -> Shell ()
 buildAssetStage app Stage {..} = do
     printLn ("\n--> Building asset stage " %s % " at line " %d) stageName stagePos
     let filteredDirectives = filter isFrom directives
-    status <- buildDockerfile app stageTag filteredDirectives -- Only build the FROM
+    status <- buildDockerfile app stageTag Nothing filteredDirectives -- Only build the FROM
     guard (status == ExitSuccess) -- Break if previous command failed
     history <- imageHistory stageTag -- Get the commands used to build the docker image
     newDockerfile <- createDockerfile stageTag (extractOnBuild history) -- Append the ONBUILD lines to the new file
-    finalStatus <- buildDockerfile app (Tag (taggedBuild stageTag)) newDockerfile -- Now build it
+    finalStatus <- buildDockerfile app (Tag (taggedBuild stageTag)) Nothing newDockerfile -- Now build it
     guard (finalStatus == ExitSuccess) -- Stop here if previous command failed
     echo ""
     echo "--> I have tagged a cache container that I can use next time to speed builds!"
@@ -288,15 +323,16 @@ buildAssetStage app Stage {..} = do
     isFrom _ = False
 
 -- | Simply call docker build for the passed arguments
-buildDockerfile :: App -> Tag -> Dockerfile -> Shell ExitCode
-buildDockerfile (App app) (Tag tag) directives = do
+buildDockerfile :: App -> Tag -> Maybe BuildOptions -> Dockerfile -> Shell ExitCode
+buildDockerfile (App app) (Tag tag) buildOPtions directives = do
     currentDirectory <- pwd
     tmpFile <- mktempfile currentDirectory "Dockerfile."
+    let BuildOptions opts = fromMaybe (BuildOptions "") buildOPtions
+    let allBuildOptions =
+            ["build", "--build-arg", "APP_NAME=" <> app, "-f", format fp tmpFile, "-t", tag, "."] <>
+            [opts]
     liftIO (writeTextFile tmpFile (Text.pack (prettyPrint directives))) -- Put the Dockerfile contents in the tmp file
-    proc
-        "docker"
-        ["build", "--build-arg", "APP_NAME=" <> app, "-f", format fp tmpFile, "-t", tag, "."]
-        empty -- Build the generated dockerfile
+    shell ("docker " <> Text.intercalate " " allBuildOptions) empty -- Build the generated dockerfile
 
 -- | Given a list of instructions, build a dockerfile where the tag is the FROM for the file and
 --   the list of instructions are wrapped with ONBUILD
@@ -309,7 +345,7 @@ createDockerfile (Tag tag) onBuildLines = do
                 mapM (onBuildRaw . toInstruction) (rights eitherDirectives) -- Append each of the ONBUILD instructions
     return file
   where
-    toInstruction [(InstructionPos inst _ _)] = inst
+    toInstruction [InstructionPos inst _ _] = inst
     toInstruction _ = error "This is not possible"
 
 -- | Extracts the list of instructions appearing in ONBUILD for a given docker history for a tag
@@ -366,7 +402,7 @@ getStages ast = filter startsWithFROM (group ast [])
     group (directive:rest) (current:prev) = group rest ((current ++ [directive]) : prev) -- Continue the currently open group
     --
     -- | Returns true if the first element in the list is a FROM directive
-    startsWithFROM ((InstructionPos (From _) _ _):_) = True
+    startsWithFROM (InstructionPos (From _) _ _:_) = True
     startsWithFROM _ = False
 
 -- | Converts a list of instructions into a Stage record
