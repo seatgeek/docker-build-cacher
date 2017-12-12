@@ -150,7 +150,6 @@ main = do
 --   and change the dockerfile to take advantage of that.
 buildFromCache :: App -> Branch -> Tag -> Maybe BuildOptions -> Dockerfile -> Shell ()
 buildFromCache app branch tag buildOptions ast = do
-    liftIO . print $ buildOptions
     changedStages <- getChangedStages app branch ast -- Inspect the dockerfile and return the stages that got their cache invalidated
     let bustedStages = replaceStages (filter alreadyCached changedStages) ast -- We replace the busted stages with cached primed ones
     build app tag buildOptions bustedStages
