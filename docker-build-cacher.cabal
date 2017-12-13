@@ -1,5 +1,5 @@
 name:                docker-build-cacher
-version:             1.8.1
+version:             1.8.2
 synopsis:            Builds a services with docker and caches all of its intermediate stages
 description:         A CLI tool to speed up multi-stage docker file builds by caching intermediate
                      stages separately, so the can be used in successive builds.
@@ -19,7 +19,7 @@ executable docker-build-cacher
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   build-depends:       base >= 4.9.1.0 && < 5
                      , turtle
-                     , language-dockerfile
+                     , language-docker
                      , containers
                      , foldl
                      , text

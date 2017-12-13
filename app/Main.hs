@@ -21,7 +21,7 @@ import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Filesystem.Path (FilePath)
-import Language.Dockerfile hiding (Tag)
+import Language.Docker hiding (Tag)
 import Prelude hiding (FilePath)
 import Text.ParserCombinators.ReadP hiding (choice)
 import Text.Read

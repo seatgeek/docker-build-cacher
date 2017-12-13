@@ -22,15 +22,11 @@ resolver: lts-9.13
 #
 packages:
 - '.'
-- location:
-    git: https://github.com/lorenzo/haskell-language-dockerfile.git
-    commit: 7a8e407805472609916818e655db0c898705e01f
-  extra-dep: true
 
 # Dependency packages to be pulled from upstream that are not in the resolver
 # (e.g., acme-missiles-0.3)
 extra-deps:
-- language-dockerfile-1.0.0
+- language-docker-1.0.0
 
 # Override default flag values for local packages and extra-deps
 flags: {}
