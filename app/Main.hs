@@ -17,11 +17,11 @@ import qualified Control.Foldl as Fold
 import Control.Monad (guard, when)
 import Data.Either (rights)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Filesystem.Path (FilePath)
-import Language.Docker hiding (Tag)
+import Language.Docker hiding (Tag, workdir)
 import Prelude hiding (FilePath)
 import Text.ParserCombinators.ReadP hiding (choice)
 import Text.Read
@@ -41,7 +41,13 @@ newtype Branch =
     Branch Text
     deriving (Show)
 
-newtype Tag =
+data SourceImage =
+    SourceImage
+
+data CachedImage =
+    CachedImage
+
+newtype Tag a =
     Tag Text
     deriving (Show, Eq)
 
@@ -59,20 +65,22 @@ newtype BuildOptions =
 
 -- | A Stage is one of the FROM directives ina dockerfile
 --
-data Stage = Stage
+data Stage a = Stage
     { stageName :: Text -- The image name
-    , stageTag :: Tag -- The image tag
+    , stageTag :: Tag a -- The image tag
     , stagePos :: Linenumber -- Where in the docker file this line is found
-    , stageAlias :: Text -- The alias used for building
+    , stageAlias :: Text -- The alias in the FROM instruction
+    , buildTag :: Tag a
     , directives :: Dockerfile -- Dockerfile is an alias for [InstructionPos]
-    , alreadyCached :: Bool -- Whether or not we have this stage built separately on the host
     } deriving (Show, Eq)
 
 data InspectedStage
-    = NotCached Stage -- When the image has not yet been built separetely
-    | Cached { stage :: Stage -- When the image was built and tagged as a separate image
+    = NotCached (Stage SourceImage) -- When the image has not yet been built separetely
+    | CacheNotInspected (Stage SourceImage) -- When the image is cached but not yet inspected
+    | Cached { stage :: Stage CachedImage -- When the image was built and tagged as a separate image
              , cacheBusters :: [(SourcePath, TargetPath)] -- List of files that are able to bust the cache
               }
+    | CacheInvalidated (Stage CachedImage)
     deriving (Show)
 
 -- | This script has 2 modes. One for building the Dockerfile, and another for caching its stages
@@ -148,16 +156,26 @@ main = do
 
 -- | Builds the provided Dockerfile. If it is a multi-stage build, check if those stages are already cached
 --   and change the dockerfile to take advantage of that.
-buildFromCache :: App -> Branch -> Tag -> Maybe BuildOptions -> Dockerfile -> Shell ()
+buildFromCache :: App -> Branch -> Tag SourceImage -> Maybe BuildOptions -> Dockerfile -> Shell ()
 buildFromCache app branch tag buildOptions ast = do
-    changedStages <- getChangedStages app branch ast -- Inspect the dockerfile and return the stages that got their cache invalidated
-    let bustedStages = replaceStages (filter alreadyCached changedStages) ast -- We replace the busted stages with cached primed ones
+    changedStages <- getChangedStages app branch ast -- Inspect the dockerfile and return
+                                                     -- the stages that got their cache invalidated. We need
+                                                     -- them to rewrite the docker file and replace the stages
+                                                     -- with the ones we have in local cache.
+    let bustedStages = replaceStages (mapMaybe alreadyCached changedStages) ast -- We replace the busted stages
+                                                                                -- with cached primed ones
     build app tag buildOptions bustedStages
+  where
+    alreadyCached (CacheInvalidated stage) = Just stage -- We only want to replace stages where the cache
+                                                        -- was invalidated by any file changes.
+    alreadyCached _ = Nothing
 
-build :: App -> Tag -> Maybe BuildOptions -> Dockerfile -> Shell ()
+build :: App -> Tag SourceImage -> Maybe BuildOptions -> Dockerfile -> Shell ()
 build app tag buildOptions ast = do
     echo "I'll start building now the main Dockerfile"
-    status <- buildDockerfile app tag buildOptions ast -- Build the main docker file with the maybe changed stages
+    status <- buildDockerfile app tag buildOptions ast -- Build the main docker file
+                                                       -- which may already have been rewritten to use the
+                                                       -- cached stages.
     case status of
         ExitSuccess ->
             echo
@@ -168,22 +186,36 @@ build app tag buildOptions ast = do
 --   can be retreived at a later point.
 cacheBuild :: App -> Branch -> Dockerfile -> Shell ()
 cacheBuild app branch ast = do
-    changedStages <- getChangedStages app branch ast
-    when (changedStages /= []) $ do
+    inspectedStages <- getChangedStages app branch ast -- Compare the current dockerfile with whatever we have
+                                                       -- in the cache. If there are any chages, then we will need
+                                                       -- to rebuild the cache for each of the changed stages.
+    let stagesToBuild = mapMaybe needsBuild inspectedStages
+    when (stagesToBuild /= []) $ do
         echo "--> Let's make the cache great again"
-        mapM_ (buildAssetStage app) changedStages -- Build each of the stages so they can be reused later
+        mapM_ (buildAssetStage app) stagesToBuild -- Build each of the stages so they can be reused later
+  where
+    needsBuild (Cached stage _) = Just stage
+    needsBuild (CacheInvalidated stage) = Just stage
+    needsBuild _ = Nothing
 
 -- | Returns a list of stages which needs to either be built separately or that did not have their cached busted
 --   by the introduction of new code.
-getChangedStages :: App -> Branch -> Dockerfile -> Shell [Stage]
+getChangedStages :: App -> Branch -> Dockerfile -> Shell [InspectedStage]
 getChangedStages app branch ast = do
-    let mainFile = last (getStages ast) -- Parse all the FROM instructions in the dockerfile
-        assetStages = takeWhile (/= mainFile) (getStages ast) -- Filter out the main FROM at the end
-        stages = mapMaybe (toStage app branch) assetStages -- Convert to Stage records, filter out errors
+    let mainFile = last (getStages ast) -- Parse all the FROM instructions in the dockerfile and only
+                                        -- keep the last FROM, which is the main stage. Anything before that
+                                        -- is considered a cacheable stage.
+        assetStages = takeWhile (/= mainFile) (getStages ast) -- Filter out the main FROM at the end and only
+                                                              -- keep the contents of the file before that instruction.
+        stages = mapMaybe (toStage app branch) assetStages -- For each the for found stages, before the main
+                                                           -- FROM instruction, convert them to Stage records
     when (length assetStages > length stages) showAliasesWarning
-  -- Time to get all the stages having changed cache files
-    bustCacheStages <- fold (getAlreadyCached stages >>= inspectCache >>= shouldBustCache) Fold.list
-    return (catMaybes bustCacheStages) -- Remove the stages that did not actually change
+    fold
+        (getAlreadyCached stages >>= -- Find the stages that we already have in local cache
+         inspectCache >>= -- Gather information to determine whether or not the cache was invalidated
+         shouldBustCache -- Determine whether or not the cache was invalidated
+         )
+        Fold.list
   where
     showAliasesWarning = do
         echo "::::::WARNING::::::"
@@ -195,40 +227,35 @@ getChangedStages app branch ast = do
 
 -- | Check whehther or not the tag exists for each of the passed stages
 --   and return only those that already exist.
-getAlreadyCached :: [Stage] -> Shell Stage
+getAlreadyCached :: [Stage SourceImage] -> Shell InspectedStage
 getAlreadyCached stages = do
     echo "--> I'm checking whether or not the stage exists as a docker image already"
-    stage@Stage {stageTag} <- select stages -- foreach stages as stage
-    printLn ("----> Looking for image " %s) (taggedBuild stageTag)
+    stage@Stage {buildTag} <- select stages -- foreach stages as stage
+    let Tag tag = buildTag -- Get the raw text value for the build tag
+    printLn ("----> Looking for image " %s) tag
     existent <-
         fold
-            (inproc
-                 "docker"
-                 ["image", "ls", taggedBuild stageTag, "--format", "{{.Repository}}"]
-                 empty)
+            (inproc "docker" ["image", "ls", tag, "--format", "{{.Repository}}"] empty)
             Fold.list -- Get the output of the command as a list of lines
     if existent == mempty
         then do
             echo "------> It does not exist, so I will need to build it myself later"
-            return (stage {alreadyCached = False})
+            return (NotCached stage)
         else do
             echo "------> It already exists, so I will then check if the cache files changed"
-            return (stage {alreadyCached = True})
+            return (CacheNotInspected stage)
 
 -- | This will inspect how an image was build and extrack the ONBUILD directives. If any of those
 --   instructions are copying or adding files to the build, they are considered "cache busters".
-inspectCache :: Stage -> Shell InspectedStage
-inspectCache stage@Stage {..} =
-    if alreadyCached
-        then return (NotCached stage)
-        else do
-            history <- imageHistory (Tag (taggedBuild stageTag))
-            let onBuildLines = extractOnBuild history
-                workdir = extractWorkdir history
-                parsedDirectivesWithErrors = fmap (parseString . Text.unpack) onBuildLines -- Parse each of the lines
-                parsedDirectives = (getFirst . rights) parsedDirectivesWithErrors -- We only keep the good lines
-                cacheBusters = extractCachePaths workdir parsedDirectives
-            return Cached {..}
+inspectCache :: InspectedStage -> Shell InspectedStage
+inspectCache (CacheNotInspected sourceStage@Stage {..}) = do
+    history <- imageHistory buildTag
+    let onBuildLines = extractOnBuild history
+        workdir = extractWorkdir history
+        parsedDirectivesWithErrors = fmap (parseString . Text.unpack) onBuildLines -- Parse each of the lines
+        parsedDirectives = (getFirst . rights) parsedDirectivesWithErrors -- We only keep the good lines
+        cacheBusters = extractCachePaths workdir parsedDirectives
+    return $ Cached (toCachedStage sourceStage) cacheBusters
   where
     extractCachePaths workdir dir =
         let filePairs = concat (mapMaybe doExtract dir) -- Get the (source, target) pairs of files copied
@@ -252,14 +279,24 @@ inspectCache stage@Stage {..} =
     doExtract _ = Nothing
     getFirst (first:_) = first
     getFirst [] = []
+-- In any other case return the same inspected stage
+inspectCache c@(NotCached _) = return c
+inspectCache c@(Cached _ _) = return c
+inspectCache c@(CacheInvalidated _) = return c
+
+toCachedStage :: Stage SourceImage -> Stage CachedImage
+toCachedStage Stage {..} =
+    let stage = Stage {..}
+        Tag sTag = stageTag
+        Tag bTag = buildTag
+    in stage {stageTag = Tag sTag, buildTag = Tag bTag}
 
 -- | Here check each of the cache buster from the image and compare them with those we have locally,
 --   if the files do not match, then we return the stage back as a result, otherwise return Nothing.
-shouldBustCache :: InspectedStage -> Shell (Maybe Stage)
-shouldBustCache (NotCached stage) = return (Just stage)
-shouldBustCache Cached {..} = do
+shouldBustCache :: InspectedStage -> Shell InspectedStage
+shouldBustCache cached@Cached {..} = do
     printLn ("----> Checking cache buster files for stage " %s) (stageName stage)
-    withContainer stage checkFiles -- Create a container to inspect the files
+    withContainer (buildTag stage) checkFiles -- Create a container to inspect the files
   where
     checkFiles containerId = do
         hasChanged <- fold (mfilter isJust (checkFileChanged containerId cacheBusters)) Fold.head
@@ -268,10 +305,10 @@ shouldBustCache Cached {..} = do
         if isJust hasChanged
             then do
                 printLn ("----> The stage " %s % " changed") (stageName stage)
-                return (Just stage)
+                return (CacheInvalidated stage)
             else do
                 printLn ("----> The stage " %s % " did not change") (stageName stage)
-                return Nothing
+                return cached
     -- |
     checkFileChanged containerId files = do
         (SourcePath file, TargetPath targetDir) <- select files
@@ -290,12 +327,16 @@ shouldBustCache Cached {..} = do
         if local == remote
             then return Nothing
             else return (Just file)
+-- In any other case return the same inspected stage
+shouldBustCache c@(NotCached _) = return c
+shouldBustCache c@(CacheNotInspected _) = return c
+shouldBustCache c@(CacheInvalidated _) = return c
 
 -- | Creates a container from a stage and passes the container id to the
 --   given shell as an argument
-withContainer :: Stage -> (Text -> Shell b) -> Shell b
-withContainer stage action = do
-    containerId <- inproc "docker" ["create", taggedBuild (stageTag stage)] empty
+withContainer :: Tag a -> (Text -> Shell b) -> Shell b
+withContainer (Tag tag) action = do
+    containerId <- inproc "docker" ["create", tag] empty
     result <- fold (action (format l containerId)) Fold.list
     _ <- removeContainer containerId -- Ignore the return code of this command
     select result -- yield each result as a separate line
@@ -305,7 +346,7 @@ withContainer stage action = do
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image
 --   so we can find it later.
-buildAssetStage :: App -> Stage -> Shell ()
+buildAssetStage :: App -> Stage CachedImage -> Shell ()
 buildAssetStage app Stage {..} = do
     printLn ("\n--> Building asset stage " %s % " at line " %d) stageName stagePos
     let filteredDirectives = filter isFrom directives
@@ -313,7 +354,7 @@ buildAssetStage app Stage {..} = do
     guard (status == ExitSuccess) -- Break if previous command failed
     history <- imageHistory stageTag -- Get the commands used to build the docker image
     newDockerfile <- createDockerfile stageTag (extractOnBuild history) -- Append the ONBUILD lines to the new file
-    finalStatus <- buildDockerfile app (Tag (taggedBuild stageTag)) Nothing newDockerfile -- Now build it
+    finalStatus <- buildDockerfile app buildTag Nothing newDockerfile -- Now build it
     guard (finalStatus == ExitSuccess) -- Stop here if previous command failed
     echo ""
     echo "--> I have tagged a cache container that I can use next time to speed builds!"
@@ -322,7 +363,7 @@ buildAssetStage app Stage {..} = do
     isFrom _ = False
 
 -- | Simply call docker build for the passed arguments
-buildDockerfile :: App -> Tag -> Maybe BuildOptions -> Dockerfile -> Shell ExitCode
+buildDockerfile :: App -> Tag a -> Maybe BuildOptions -> Dockerfile -> Shell ExitCode
 buildDockerfile (App app) (Tag tag) buildOPtions directives = do
     currentDirectory <- pwd
     tmpFile <- mktempfile currentDirectory "Dockerfile."
@@ -335,7 +376,7 @@ buildDockerfile (App app) (Tag tag) buildOPtions directives = do
 
 -- | Given a list of instructions, build a dockerfile where the tag is the FROM for the file and
 --   the list of instructions are wrapped with ONBUILD
-createDockerfile :: Tag -> [Text] -> Shell Dockerfile
+createDockerfile :: Tag a -> [Text] -> Shell Dockerfile
 createDockerfile (Tag tag) onBuildLines = do
     let eitherDirectives = map (parseString . Text.unpack) onBuildLines
         file =
@@ -380,7 +421,7 @@ extractWorkdir instructions =
     isOnBuild line = Text.isPrefixOf onBuildPrefix (lineToText line)
 
 -- | Calls docker history for the given image name and returns the output as a list
-imageHistory :: Tag -> Shell [Line]
+imageHistory :: Tag a -> Shell [Line]
 imageHistory (Tag tag) = do
     printLn ("----> Checking the docker image history for " %s) tag
     out <- fold fetchHistory Fold.list -- Buffer all the output of the imageHistory shell
@@ -405,12 +446,13 @@ getStages ast = filter startsWithFROM (group ast [])
     startsWithFROM _ = False
 
 -- | Converts a list of instructions into a Stage record
-toStage :: App -> Branch -> Dockerfile -> Maybe Stage
+toStage :: App -> Branch -> Dockerfile -> Maybe (Stage a)
 toStage (App app) (Branch branch) directives = do
     (stageName, stagePos, stageAlias) <- getStageInfo directives -- If getStageInfo returns Nothing, skip the rest
     let sanitized = sanitize stageName
-        stageTag = Tag (app <> "__branch__" <> branch <> "__stage__" <> sanitized)
-        alreadyCached = False
+        tagName = app <> "__branch__" <> branch <> "__stage__" <> sanitized
+        stageTag = Tag tagName
+        buildTag = Tag (tagName <> "-build")
     return Stage {..}
   where
     getStageInfo :: [InstructionPos] -> Maybe (Text, Linenumber, Text)
@@ -433,12 +475,9 @@ parseAlias =
     Text.replace " AS " " as " . -- Normalize AS with as
     Text.pack
 
-taggedBuild :: Tag -> Text
-taggedBuild (Tag tag) = tag <> "-build"
-
 -- | Given a list of stages and the AST for a Dockerfile, replace all the FROM instructions
 --   with their corresponding images as described in the Stage record.
-replaceStages :: [Stage] -> Dockerfile -> Dockerfile
+replaceStages :: [Stage CachedImage] -> Dockerfile -> Dockerfile
 replaceStages stages dockerLines = fmap replaceStage dockerLines
   where
     stagesMap = Map.fromList (map createStagePairs stages)
@@ -449,12 +488,12 @@ replaceStages stages dockerLines = fmap replaceStage dockerLines
     replaceStage directive@(InstructionPos (From (TaggedImage _ tag)) file pos) =
         case Map.lookup (parseAlias tag) stagesMap of
             Nothing -> directive
-            Just Stage {stageTag, stageAlias} ->
-                InstructionPos
-                    (From
-                         (TaggedImage (Text.unpack (taggedBuild stageTag)) (formatAlias stageAlias)))
-                    file
-                    pos
+            Just Stage {buildTag, stageAlias} ->
+                let Tag t = buildTag
+                in InstructionPos
+                       (From (TaggedImage (Text.unpack t) (formatAlias stageAlias)))
+                       file
+                       pos
     replaceStage directive = directive
     formatAlias alias = "latest as " <> Text.unpack alias
 
