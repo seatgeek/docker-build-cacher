@@ -182,14 +182,14 @@ cacheBuild app branch ast = do
     inspectedStages <- getChangedStages app branch ast -- Compare the current dockerfile with whatever we have
                                                        -- in the cache. If there are any chages, then we will need
                                                        -- to rebuild the cache for each of the changed stages.
-    let stagesToBuild = mapMaybe needsBuild inspectedStages
-    when (stagesToBuild /= []) $ do
+    let stagesToBuildFresh = [s | NotCached s <- inspectedStages]
+    let stagesToReBuild = [s | CacheInvalidated s <- inspectedStages]
+    when (stagesToBuildFresh /= []) $ do
+        echo "--> Let's build the cache for the first time"
+        mapM_ (buildAssetStage app) stagesToBuildFresh -- Build cached images for the first time
+    when (stagesToReBuild /= []) $ do
         echo "--> Let's make the cache great again"
-        mapM_ (buildAssetStage app) stagesToBuild -- Build each of the stages so they can be reused later
-  where
-    needsBuild (Cached stage _) = Just stage
-    needsBuild (CacheInvalidated stage) = Just stage
-    needsBuild _ = Nothing
+        mapM_ (reBuildAssetStage app) stagesToReBuild -- Build each of the stages so they can be reused later
 
 -- | Returns a list of stages which needs to either be built separately or that did not have their cached busted
 --   by the introduction of new code.
@@ -341,21 +341,40 @@ withContainer (Tag tag) action = do
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image
 --   so we can find it later.
-buildAssetStage :: App -> Stage CachedImage -> Shell ()
+buildAssetStage :: App -> Stage SourceImage -> Shell ()
 buildAssetStage app Stage {..} = do
-    printLn ("\n--> Building asset stage " %s % " at line " %d) stageName stagePos
+    printLn
+        ("\n--> Building asset stage " %s % " at line " %d % " for the first time")
+        stageName
+        stagePos
     let filteredDirectives = filter isFrom directives
-    status <- buildDockerfile app stageTag Nothing filteredDirectives -- Only build the FROM
-    guard (status == ExitSuccess) -- Break if previous command failed
-    history <- imageHistory stageTag -- Get the commands used to build the docker image
-    newDockerfile <- createDockerfile stageTag (extractOnBuild history) -- Append the ONBUILD lines to the new file
-    finalStatus <- buildDockerfile app buildTag Nothing newDockerfile -- Now build it
-    guard (finalStatus == ExitSuccess) -- Stop here if previous command failed
-    echo ""
-    echo "--> I have tagged a cache container that I can use next time to speed builds!"
+    doStageBuild app stageTag buildTag filteredDirectives
   where
     isFrom (InstructionPos (From _) _ _) = True
     isFrom _ = False
+
+-- | The goal is to create a temporary dockefile in this same folder with the contents
+--   if the stage variable, call docker build with the generated file and tag the image
+--   so we can find it later.
+reBuildAssetStage :: App -> Stage CachedImage -> Shell ()
+reBuildAssetStage app Stage {..} = do
+    printLn ("\n--> Rebuilding asset stage " %s % " at line " %d) stageName stagePos
+    let fromInstruction =
+            toDockerfile $ do
+                let Tag t = buildTag
+                from $ Text.unpack t `tagged` "latest" -- Use the cached image as base for the new one
+    doStageBuild app stageTag buildTag fromInstruction
+
+doStageBuild :: App -> Tag a -> Tag b -> Dockerfile -> Shell ()
+doStageBuild app sourceTag targetTag directives = do
+    status <- buildDockerfile app sourceTag Nothing directives -- Only build the FROM
+    guard (status == ExitSuccess) -- Break if previous command failed
+    history <- imageHistory sourceTag -- Get the commands used to build the docker image
+    newDockerfile <- createDockerfile sourceTag (extractOnBuild history) -- Append the ONBUILD lines to the new file
+    finalStatus <- buildDockerfile app targetTag Nothing newDockerfile -- Now build it
+    guard (finalStatus == ExitSuccess) -- Stop here if previous command failed
+    echo ""
+    echo "--> I have tagged a cache container that I can use next time to speed builds!"
 
 -- | Simply call docker build for the passed arguments
 buildDockerfile :: App -> Tag a -> Maybe BuildOptions -> Dockerfile -> Shell ExitCode
@@ -450,6 +469,7 @@ toStage (App app) (Branch branch) directives = do
         buildTag = Tag (tagName <> "-build")
     return Stage {..}
   where
+    extractInfo :: Dockerfile -> Maybe (Text, Linenumber, Text)
     extractInfo (InstructionPos {instruction, lineNumber}:_) = getStageInfo instruction lineNumber
     extractInfo _ = Nothing
     getStageInfo :: Instruction -> Linenumber -> Maybe (Text, Linenumber, Text)
