@@ -1,7 +1,7 @@
 #!/usr/bin/env stack
 {- stack
   runghc
-  --resolver lts-9.14
+  --resolver lts-10.2
   --install-ghc
   --package turtle
   --package language-dockerfile
@@ -16,14 +16,15 @@ module Main where
 import qualified Control.Foldl as Fold
 import Control.Monad (guard, when)
 import Data.Either (rights)
+import Data.List.NonEmpty (toList)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
-import Filesystem.Path (FilePath)
+import Filesystem.Path (FilePath(..))
 import Language.Docker hiding (Tag, workdir)
 import Prelude hiding (FilePath)
-import Text.ParserCombinators.ReadP hiding (choice)
+import Text.ParserCombinators.ReadP
 import Text.Read
 import Turtle
 
@@ -49,14 +50,6 @@ data CachedImage =
 
 newtype Tag a =
     Tag Text
-    deriving (Show, Eq)
-
-newtype SourcePath =
-    SourcePath FilePath
-    deriving (Show, Eq)
-
-newtype TargetPath =
-    TargetPath FilePath
     deriving (Show, Eq)
 
 newtype BuildOptions =
@@ -263,19 +256,19 @@ inspectCache (CacheNotInspected sourceStage@Stage {..}) = do
     --
     -- | Prepend a given target dir to the target path
     prependWorkdir workdir (source, TargetPath target) =
-        if relative target -- If the target path is relative, we need to prepend the workdir
-            then (source, TargetPath (collapse (workdir </> target))) -- Remove the ./ prefix and prepend workdir
-            else (source, TargetPath target)
+        let dest = fromString target
+            prependedDest = Text.unpack . format fp $ collapse (workdir </> dest)
+        in if relative dest -- If the target path is relative, we need to prepend the workdir
+               then (source, TargetPath prependedDest) -- Remove the ./ prefix and prepend workdir
+               else (source, TargetPath target)
     --
     -- | COPY allows multiple paths in the same line, we need to convert each to a separate path
-    doExtract (InstructionPos (Copy _ t) _ _) =
-        let target:allSources = (reverse . Text.words . Text.pack) t -- Make sure we get all the files in COPY
-            sourcePaths = fmap toSource allSources
-        in Just (zip sourcePaths (repeat (toTarget target)))
+    doExtract (InstructionPos (Copy CopyArgs {sourcePaths, targetPath}) _ _) =
+        Just (zip (toList sourcePaths) (repeat targetPath))
     --
     -- | This case is simpler, we only need to convert the source and target from ADD
-    doExtract (InstructionPos (Add fr t) _ _) =
-        Just [((toSource . Text.pack) fr, (toTarget . Text.pack) t)]
+    doExtract (InstructionPos (Add AddArgs {sourcePaths, targetPath}) _ _) =
+        Just (zip (toList sourcePaths) (repeat targetPath))
     doExtract _ = Nothing
     getFirst (first:_) = first
     getFirst [] = []
@@ -311,7 +304,9 @@ shouldBustCache cached@Cached {..} = do
                 return cached
     -- |
     checkFileChanged containerId files = do
-        (SourcePath file, TargetPath targetDir) <- select files
+        (SourcePath src, TargetPath dest) <- select files
+        let file = fromText $ Text.pack src
+        let targetDir = fromText $ Text.pack dest
         printLn ("------> Checking file '" %fp % "' in directory " %fp) file targetDir
         currentDirectory <- pwd
         tempFile <- mktempfile currentDirectory "comp"
@@ -448,19 +443,23 @@ getStages ast = filter startsWithFROM (group ast [])
 -- | Converts a list of instructions into a Stage record
 toStage :: App -> Branch -> Dockerfile -> Maybe (Stage a)
 toStage (App app) (Branch branch) directives = do
-    (stageName, stagePos, stageAlias) <- getStageInfo directives -- If getStageInfo returns Nothing, skip the rest
+    (stageName, stagePos, stageAlias) <- extractInfo directives -- If getStageInfo returns Nothing, skip the rest
     let sanitized = sanitize stageName
         tagName = app <> "__branch__" <> branch <> "__stage__" <> sanitized
         stageTag = Tag tagName
         buildTag = Tag (tagName <> "-build")
     return Stage {..}
   where
-    getStageInfo :: [InstructionPos] -> Maybe (Text, Linenumber, Text)
-    getStageInfo ((InstructionPos (From (TaggedImage name tag)) _ pos):_) =
-        if Text.isInfixOf " as " (Text.pack tag) || Text.isInfixOf " AS " (Text.pack tag) -- Make sure the FROM is aliased
-            then Just (Text.pack name, pos, parseAlias tag)
-            else Nothing
-    getStageInfo _ = Nothing
+    extractInfo (InstructionPos {instruction, lineNumber}:_) = getStageInfo instruction lineNumber
+    extractInfo _ = Nothing
+    getStageInfo :: Instruction -> Linenumber -> Maybe (Text, Linenumber, Text)
+    getStageInfo (From (TaggedImage name _ (Just (ImageAlias alias)))) pos =
+        Just (Text.pack name, pos, Text.pack alias)
+    getStageInfo (From (UntaggedImage name (Just (ImageAlias alias)))) pos =
+        Just (Text.pack name, pos, Text.pack alias)
+    getStageInfo (From (DigestedImage name _ (Just (ImageAlias alias)))) pos =
+        Just (Text.pack name, pos, Text.pack alias)
+    getStageInfo _ _ = Nothing
     --
     -- | Makes a string safe to use it as a file name
     sanitize = Text.replace "/" "-" . Text.replace ":" "-"
@@ -478,32 +477,32 @@ parseAlias =
 -- | Given a list of stages and the AST for a Dockerfile, replace all the FROM instructions
 --   with their corresponding images as described in the Stage record.
 replaceStages :: [Stage CachedImage] -> Dockerfile -> Dockerfile
-replaceStages stages dockerLines = fmap replaceStage dockerLines
+replaceStages stages dockerLines =
+    fmap
+        (\InstructionPos {..} -> InstructionPos {instruction = replaceStage instruction, ..})
+        dockerLines
   where
     stagesMap = Map.fromList (map createStagePairs stages)
     createStagePairs stage@(Stage {..}) = (stageAlias, stage)
     --
     -- | Find whehter or not we have extracted a stage with the same alias
     --   If we did, then replace the FROM directive with our own version
-    replaceStage directive@(InstructionPos (From (TaggedImage _ tag)) file pos) =
-        case Map.lookup (parseAlias tag) stagesMap of
+    replaceStage directive@(From (TaggedImage _ _ (Just (ImageAlias imageAlias)))) =
+        replaceKnownAlias directive imageAlias
+    replaceStage directive@(From (UntaggedImage _ (Just (ImageAlias imageAlias)))) =
+        replaceKnownAlias directive imageAlias
+    replaceStage directive@(From (DigestedImage _ _ (Just (ImageAlias imageAlias)))) =
+        replaceKnownAlias directive imageAlias
+    replaceStage directive = directive
+    replaceKnownAlias directive imageAlias =
+        case Map.lookup (Text.pack imageAlias) stagesMap of
             Nothing -> directive
             Just Stage {buildTag, stageAlias} ->
                 let Tag t = buildTag
-                in InstructionPos
-                       (From (TaggedImage (Text.unpack t) (formatAlias stageAlias)))
-                       file
-                       pos
-    replaceStage directive = directive
-    formatAlias alias = "latest as " <> Text.unpack alias
+                in From (TaggedImage (Text.unpack t) "latest" (formatAlias stageAlias))
+    formatAlias = Just . fromString . Text.unpack
 
 printLn message = printf (message % "\n")
-
--- | Transforms a text to SourcePath
-toSource = SourcePath . fromText
-
--- | Transforms a text to TargetPath
-toTarget = TargetPath . fromText
 
 needEnv varName = do
     value <- need varName

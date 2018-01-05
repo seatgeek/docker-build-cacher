@@ -1,6 +1,6 @@
 .PHONY: publish clean
 
-DOCKER_LINUX_IMAGE="fpco/stack-build:lts-9.13"
+DOCKER_LINUX_IMAGE="fpco/stack-build:lts-10.2"
 API_HOST=https://api.github.com
 UPLOAD_HOST=https://uploads.github.com
 DASH_VERSION=$(shell echo $(VERSION) | sed -e s/\\./-/g)
