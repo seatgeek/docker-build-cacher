@@ -21,7 +21,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
-import Filesystem.Path (FilePath(..))
+import Filesystem.Path (FilePath)
 import Language.Docker hiding (Tag, workdir)
 import Prelude hiding (FilePath)
 import Text.ParserCombinators.ReadP
