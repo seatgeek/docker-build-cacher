@@ -1,3 +1,4 @@
 dist-*
 Dockerfile
+docker-build-cacher.cabal
 

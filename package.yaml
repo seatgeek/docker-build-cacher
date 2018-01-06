@@ -1,0 +1,41 @@
+name: docker-build-cacher
+version: '1.9.0'
+synopsis: Builds a services with docker and caches all of its intermediate stages
+description: A CLI tool to speed up multi-stage docker file builds by caching intermediate
+category: Operations
+author:
+  - José Lorenzo Rodríguez
+maintainer:
+  - lorenzo@seatgeek.com
+copyright:
+  - Seatgeek, Copyright (c) 2017
+license: BSD3
+github: seatgeek/docker-build-cacher
+extra-source-files:
+  - README.md
+
+dependencies:
+  - base >=4.9.1.0 && <5
+  - turtle
+  - language-docker >= 2.0.1
+  - containers
+  - foldl
+  - text
+  - system-filepath
+
+executables:
+  docker-build-cacher:
+    main: Main.hs
+    source-dirs: app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    - -Wall
+    - -fno-warn-unused-do-bind
+    when:
+      # OS X does not support static build https://developer.apple.com/library/content/qa/qa1118/
+      - condition: '!(os(osx))'
+        ld-options:
+          - -static
+          - -pthread
