@@ -161,6 +161,8 @@ buildFromCache app branch tag buildOptions ast = do
   where
     alreadyCached (CacheInvalidated stage) = Just stage -- We only want to replace stages where the cache
                                                         -- was invalidated by any file changes.
+    alreadyCached (Cached stage _) = Just stage -- Likewise, once we have a cached stage, we need to keep using it
+                                                -- in succesive builds, so the cache is not invalidated again.
     alreadyCached _ = Nothing
 
 build :: App -> Tag SourceImage -> Maybe BuildOptions -> Dockerfile -> Shell ()
