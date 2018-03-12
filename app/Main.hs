@@ -364,7 +364,7 @@ reBuildAssetStage app Stage {..} = do
     let fromInstruction =
             toDockerfile $ do
                 let Tag t = buildTag
-                from $ Text.unpack t `tagged` "latest" -- Use the cached image as base for the new one
+                from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
     doStageBuild app stageTag buildTag fromInstruction
 
 doStageBuild :: App -> Tag a -> Tag b -> Dockerfile -> Shell ()
@@ -397,7 +397,7 @@ createDockerfile (Tag tag) onBuildLines = do
     let eitherDirectives = map (parseString . Text.unpack) onBuildLines
         file =
             toDockerfile $ do
-                from (tagged (Text.unpack tag) "latest")
+                from $ toImage tag `tagged` "latest"
                 mapM (onBuildRaw . toInstruction) (rights eitherDirectives) -- Append each of the ONBUILD instructions
     return file
   where
@@ -475,12 +475,12 @@ toStage (App app) (Branch branch) directives = do
     extractInfo (InstructionPos {instruction, lineNumber}:_) = getStageInfo instruction lineNumber
     extractInfo _ = Nothing
     getStageInfo :: Instruction -> Linenumber -> Maybe (Text, Linenumber, Text)
-    getStageInfo (From (TaggedImage name _ (Just (ImageAlias alias)))) pos =
-        Just (Text.pack name, pos, Text.pack alias)
-    getStageInfo (From (UntaggedImage name (Just (ImageAlias alias)))) pos =
-        Just (Text.pack name, pos, Text.pack alias)
-    getStageInfo (From (DigestedImage name _ (Just (ImageAlias alias)))) pos =
-        Just (Text.pack name, pos, Text.pack alias)
+    getStageInfo (From (TaggedImage Image {imageName} _ (Just (ImageAlias alias)))) pos =
+        Just (Text.pack imageName, pos, Text.pack alias)
+    getStageInfo (From (UntaggedImage Image {imageName} (Just (ImageAlias alias)))) pos =
+        Just (Text.pack imageName, pos, Text.pack alias)
+    getStageInfo (From (DigestedImage Image {imageName} _ (Just (ImageAlias alias)))) pos =
+        Just (Text.pack imageName, pos, Text.pack alias)
     getStageInfo _ _ = Nothing
     --
     -- | Makes a string safe to use it as a file name
@@ -521,10 +521,12 @@ replaceStages stages dockerLines =
             Nothing -> directive
             Just Stage {buildTag, stageAlias} ->
                 let Tag t = buildTag
-                in From (TaggedImage (Text.unpack t) "latest" (formatAlias stageAlias))
+                in From (TaggedImage (toImage t) "latest" (formatAlias stageAlias))
     formatAlias = Just . fromString . Text.unpack
 
 printLn message = printf (message % "\n")
+
+toImage = fromString . Text.unpack
 
 needEnv varName = do
     value <- need varName
