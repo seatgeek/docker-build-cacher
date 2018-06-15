@@ -1,12 +1,3 @@
-#!/usr/bin/env stack
-{- stack
-  runghc
-  --resolver lts-10.2
-  --install-ghc
-  --package turtle
-  --package language-dockerfile
-  --package containers
--}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NamedFieldPuns #-}
@@ -21,6 +12,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
+import qualified Data.Text.Lazy as LT
 import Filesystem.Path (FilePath)
 import Language.Docker hiding (Tag, workdir)
 import Prelude hiding (FilePath)
@@ -92,7 +84,7 @@ instance Read Mode where
             , ("cache", Cache)
             ]
       where
-        strValMap = map (\(x, y) -> lift $ string x >> return y)
+        strValMap = map (\(flag, result) -> lift $ string flag >> return result)
 
 data Args = Args
     { mode :: Mode
@@ -184,8 +176,8 @@ cacheBuild app branch ast = do
     inspectedStages <- getChangedStages app branch ast -- Compare the current dockerfile with whatever we have
                                                        -- in the cache. If there are any chages, then we will need
                                                        -- to rebuild the cache for each of the changed stages.
-    let stagesToBuildFresh = [s | NotCached s <- inspectedStages]
-    let stagesToReBuild = [s | CacheInvalidated s <- inspectedStages]
+    let stagesToBuildFresh = [stage | NotCached stage <- inspectedStages]
+    let stagesToReBuild = [stage | CacheInvalidated stage <- inspectedStages]
     when (stagesToBuildFresh /= []) $ do
         echo "--> Let's build the cache for the first time"
         mapM_ (buildAssetStage app) stagesToBuildFresh -- Build cached images for the first time
@@ -247,7 +239,7 @@ inspectCache (CacheNotInspected sourceStage@Stage {..}) = do
     history <- imageHistory buildTag
     let onBuildLines = extractOnBuild history
         workdir = extractWorkdir history
-        parsedDirectivesWithErrors = fmap (parseString . Text.unpack) onBuildLines -- Parse each of the lines
+        parsedDirectivesWithErrors = fmap parseText onBuildLines -- Parse each of the lines
         parsedDirectives = (getFirst . rights) parsedDirectivesWithErrors -- We only keep the good lines
         cacheBusters = extractCachePaths workdir parsedDirectives
     return $ Cached (toCachedStage sourceStage) cacheBusters
@@ -258,8 +250,8 @@ inspectCache (CacheNotInspected sourceStage@Stage {..}) = do
     --
     -- | Prepend a given target dir to the target path
     prependWorkdir workdir (source, TargetPath target) =
-        let dest = fromString target
-            prependedDest = Text.unpack . format fp $ collapse (workdir </> dest)
+        let dest = fromText target
+            prependedDest = format fp (collapse (workdir </> dest))
         in if relative dest -- If the target path is relative, we need to prepend the workdir
                then (source, TargetPath prependedDest) -- Remove the ./ prefix and prepend workdir
                else (source, TargetPath target)
@@ -307,8 +299,8 @@ shouldBustCache cached@Cached {..} = do
     -- |
     checkFileChanged containerId files = do
         (SourcePath src, TargetPath dest) <- select files
-        let file = fromText $ Text.pack src
-        let targetDir = fromText $ Text.pack dest
+        let file = fromText src
+        let targetDir = fromText dest
         printLn ("------> Checking file '" %fp % "' in directory " %fp) file targetDir
         currentDirectory <- pwd
         tempFile <- mktempfile currentDirectory "comp"
@@ -387,18 +379,19 @@ buildDockerfile (App app) (Tag tag) buildOPtions directives = do
     let allBuildOptions =
             ["build", "--build-arg", "APP_NAME=" <> app, "-f", format fp tmpFile, "-t", tag, "."] <>
             [opts]
-    liftIO (writeTextFile tmpFile (Text.pack (prettyPrint directives))) -- Put the Dockerfile contents in the tmp file
+    liftIO (writeTextFile tmpFile (LT.toStrict (prettyPrint directives))) -- Put the Dockerfile contents in the tmp file
     shell ("docker " <> Text.intercalate " " allBuildOptions) empty -- Build the generated dockerfile
 
 -- | Given a list of instructions, build a dockerfile where the tag is the FROM for the file and
 --   the list of instructions are wrapped with ONBUILD
 createDockerfile :: Tag a -> [Text] -> Shell Dockerfile
 createDockerfile (Tag tag) onBuildLines = do
-    let eitherDirectives = map (parseString . Text.unpack) onBuildLines
+    let eitherDirectives = map parseText onBuildLines
+        validDirectives = rights eitherDirectives -- Just in case, filter out bad directives
         file =
             toDockerfile $ do
                 from $ toImage tag `tagged` "latest"
-                mapM (onBuildRaw . toInstruction) (rights eitherDirectives) -- Append each of the ONBUILD instructions
+                mapM (onBuildRaw . toInstruction) validDirectives -- Append each of the ONBUILD instructions
     return file
   where
     toInstruction [InstructionPos inst _ _] = inst
@@ -406,7 +399,7 @@ createDockerfile (Tag tag) onBuildLines = do
 
 -- | Extracts the list of instructions appearing in ONBUILD for a given docker history for a tag
 extractOnBuild :: [Line] -> [Text]
-extractOnBuild lines = doExtract lines
+extractOnBuild = doExtract
   where
     onBuildPrefix = "/bin/sh -c #(nop)  ONBUILD "
     --
@@ -474,13 +467,13 @@ toStage (App app) (Branch branch) directives = do
     extractInfo :: Dockerfile -> Maybe (Text, Linenumber, Text)
     extractInfo (InstructionPos {instruction, lineNumber}:_) = getStageInfo instruction lineNumber
     extractInfo _ = Nothing
-    getStageInfo :: Instruction -> Linenumber -> Maybe (Text, Linenumber, Text)
+    getStageInfo :: Instruction Text -> Linenumber -> Maybe (Text, Linenumber, Text)
     getStageInfo (From (TaggedImage Image {imageName} _ (Just (ImageAlias alias)))) pos =
-        Just (Text.pack imageName, pos, Text.pack alias)
+        Just (imageName, pos, alias)
     getStageInfo (From (UntaggedImage Image {imageName} (Just (ImageAlias alias)))) pos =
-        Just (Text.pack imageName, pos, Text.pack alias)
+        Just (imageName, pos, alias)
     getStageInfo (From (DigestedImage Image {imageName} _ (Just (ImageAlias alias)))) pos =
-        Just (Text.pack imageName, pos, Text.pack alias)
+        Just (imageName, pos, alias)
     getStageInfo _ _ = Nothing
     --
     -- | Makes a string safe to use it as a file name
@@ -499,13 +492,11 @@ parseAlias =
 -- | Given a list of stages and the AST for a Dockerfile, replace all the FROM instructions
 --   with their corresponding images as described in the Stage record.
 replaceStages :: [Stage CachedImage] -> Dockerfile -> Dockerfile
-replaceStages stages dockerLines =
-    fmap
-        (\InstructionPos {..} -> InstructionPos {instruction = replaceStage instruction, ..})
-        dockerLines
+replaceStages stages =
+    fmap (\InstructionPos {..} -> InstructionPos {instruction = replaceStage instruction, ..})
   where
     stagesMap = Map.fromList (map createStagePairs stages)
-    createStagePairs stage@(Stage {..}) = (stageAlias, stage)
+    createStagePairs stage@Stage {..} = (stageAlias, stage)
     --
     -- | Find whehter or not we have extracted a stage with the same alias
     --   If we did, then replace the FROM directive with our own version
@@ -517,17 +508,20 @@ replaceStages stages dockerLines =
         replaceKnownAlias directive imageAlias
     replaceStage directive = directive
     replaceKnownAlias directive imageAlias =
-        case Map.lookup (Text.pack imageAlias) stagesMap of
+        case Map.lookup imageAlias stagesMap of
             Nothing -> directive
             Just Stage {buildTag, stageAlias} ->
                 let Tag t = buildTag
                 in From (TaggedImage (toImage t) "latest" (formatAlias stageAlias))
     formatAlias = Just . fromString . Text.unpack
 
+printLn :: MonadIO io => Format (io ()) r -> r
 printLn message = printf (message % "\n")
 
+toImage :: Text -> Image
 toImage = fromString . Text.unpack
 
+needEnv :: MonadIO m => Text -> m Text
 needEnv varName = do
     value <- need varName
     case value of
