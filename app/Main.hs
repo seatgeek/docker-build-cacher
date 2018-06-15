@@ -51,17 +51,27 @@ newtype BuildOptions =
 -- | A Stage is one of the FROM directives ina dockerfile
 --
 data Stage a = Stage
-    { stageName :: Text -- The image name, for example "ubuntu"
-    , stageImageName :: ImageName a -- The image tag,
-    , stagePos :: Linenumber -- Where in the docker file this line is found
-    , stageAlias :: Text -- The alias in the FROM instruction, for example "builder" in "FROM ubuntu:16.10 AS builder"
-    , buildImageName :: ImageName a -- The resulting
-    , directives :: Dockerfile -- Dockerfile is an alias for [InstructionPos]
+    { stageName :: !Text -- ^ The image name, This is usually just the alias
+                        --
+    , stageImageName :: !(ImageName a) -- ^ The name of the docker image to generate a separate cache for
+                                       -- this is pretty much the "template" image to use for 'buildImageName'
+                                       --
+    , stageFallbackImage :: !(Maybe (ImageName a)) -- ^ If the stageImageName does not exist, then we can try building
+                                                   -- from another template, usually the one from the master branch
+                                                   --
+    , stagePos :: !Linenumber -- ^ Where in the docker file this line is found
+    , stageAlias :: !Text -- ^ The alias in the FROM instruction, for example "builder" in "FROM ubuntu:16.10 AS builder"
+    , buildImageName :: !(ImageName a) -- ^ The resulting image image, after caching all assets
+    , directives :: !Dockerfile -- ^ Dockerfile is an alias for [InstructionPos]
     } deriving (Show, Eq)
 
-data InspectedStage
+newtype NotInspectedCache =
+    NotInspectedCache StageCache
+
+data StageCache
     = NotCached (Stage SourceImage) -- When the image has not yet been built separetely
-    | CacheNotInspected (Stage SourceImage) -- When the image is cached but not yet inspected
+    | FallbackCache (Stage SourceImage) -- When the cache was not present but we looked at a falback key
+                    StageCache -- The fallback cache
     | Cached { stage :: Stage CachedImage -- When the image was built and tagged as a separate image
              , cacheBusters :: [(SourcePath, TargetPath)] -- List of files that are able to bust the cache
               }
@@ -109,6 +119,7 @@ main = do
         options "Builds a docker file and caches its stages" parser -- Parse the CLI arguments as a Mode
     app <- App <$> needEnv "APP_NAME" -- Get the APP environment variable and then wrap it in App
     branch <- Branch <$> needEnv "GIT_BRANCH"
+    fallbackBranch <- fmap Branch <$> need "FALLBACK_BRANCH"
     maybeFile <-
         do file <- need "DOCKERFILE" -- Get the dockerfile path if any
            return (fmap fromText file) -- And transform it to a FilePath
@@ -126,7 +137,7 @@ main = do
                 Cache ->
                     if noCacheStages
                         then echo "Skipping... I was told not to cache any stages separetely"
-                        else sh (cacheBuild app branch ast)
+                        else sh (cacheBuild app branch fallbackBranch ast)
                 Build -> do
                     name <- ImageName <$> needEnv "DOCKER_TAG"
                     buildOPtions <-
@@ -137,25 +148,35 @@ main = do
                                else return (fmap BuildOptions opts)
                     if noCacheStages
                         then sh (build app name buildOPtions ast)
-                        else sh (buildFromCache app branch name buildOPtions ast)
+                        else sh (buildFromCache app branch fallbackBranch name buildOPtions ast)
 
 -- | Builds the provided Dockerfile. If it is a multi-stage build, check if those stages are already cached
 --   and change the dockerfile to take advantage of that.
 buildFromCache ::
-       App -> Branch -> ImageName SourceImage -> Maybe BuildOptions -> Dockerfile -> Shell ()
-buildFromCache app branch imageName buildOptions ast = do
-    changedStages <- getChangedStages app branch ast -- Inspect the dockerfile and return
-                                                     -- the stages that got their cache invalidated. We need
-                                                     -- them to rewrite the docker file and replace the stages
-                                                     -- with the ones we have in local cache.
-    let bustedStages = replaceStages (mapMaybe alreadyCached changedStages) ast -- We replace the busted stages
+       App
+    -> Branch
+    -> Maybe Branch
+    -> ImageName SourceImage
+    -> Maybe BuildOptions
+    -> Dockerfile
+    -> Shell ()
+buildFromCache app branch fallbackBranch imageName buildOptions ast = do
+    changedStages <- getChangedStages app branch fallbackBranch ast -- Inspect the dockerfile and return
+                                                                    -- the stages that got their cache invalidated. We need
+                                                                    -- them to rewrite the docker file and replace the stages
+                                                                    -- with the ones we have in local cache.
+    let cachedStages = replaceStages (mapMaybe alreadyCached changedStages) ast -- We replace the busted stages
                                                                                 -- with cached primed ones
-    build app imageName buildOptions bustedStages
+    build app imageName buildOptions cachedStages
   where
-    alreadyCached (CacheInvalidated stage) = Just stage -- We only want to replace stages where the cache
+    alreadyCached :: StageCache -> Maybe (Stage CachedImage)
+    alreadyCached (CacheInvalidated stage) = Just stage -- We want to replace stages where the cache
                                                         -- was invalidated by any file changes.
     alreadyCached (Cached stage _) = Just stage -- Likewise, once we have a cached stage, we need to keep using it
                                                 -- in succesive builds, so the cache is not invalidated again.
+    alreadyCached (FallbackCache _ (CacheInvalidated stage)) = Just stage -- Finally, if we are using a fallback, we apply
+                                                                          -- the same rules as above for the fallback key
+    alreadyCached (FallbackCache _ (Cached stage _)) = Just stage
     alreadyCached _ = Nothing
 
 build :: App -> ImageName SourceImage -> Maybe BuildOptions -> Dockerfile -> Shell ()
@@ -172,35 +193,39 @@ build app imageName buildOptions ast = do
 
 -- | One a dockefile is built, we can extract each of the stages separately and then tag them, so the cache
 --   can be retreived at a later point.
-cacheBuild :: App -> Branch -> Dockerfile -> Shell ()
-cacheBuild app branch ast = do
-    inspectedStages <- getChangedStages app branch ast -- Compare the current dockerfile with whatever we have
-                                                       -- in the cache. If there are any chages, then we will need
-                                                       -- to rebuild the cache for each of the changed stages.
+cacheBuild :: App -> Branch -> Maybe Branch -> Dockerfile -> Shell ()
+cacheBuild app branch fallbackBranch ast = do
+    inspectedStages <- getChangedStages app branch fallbackBranch ast -- Compare the current dockerfile with whatever we have
+                                                                      -- in the cache. If there are any chages, then we will need
+                                                                      -- to rebuild the cache for each of the changed stages.
     let stagesToBuildFresh = [stage | NotCached stage <- inspectedStages]
     let stagesToReBuild = [stage | CacheInvalidated stage <- inspectedStages]
+    let stagesToBuildFromFallback =
+            [(uncached, cached) | FallbackCache uncached (Cached cached _) <- inspectedStages]
     when (stagesToBuildFresh /= []) $ do
         echo "--> Let's build the cache for the first time"
         mapM_ (buildAssetStage app) stagesToBuildFresh -- Build cached images for the first time
+    when (stagesToBuildFromFallback /= []) $ do
+        echo "--> Let's build the cache for the first time using a fallback"
+        mapM_ (uncurry (reBuildFromFallback app)) stagesToBuildFromFallback
     when (stagesToReBuild /= []) $ do
-        echo "--> Let's make the cache great again"
+        echo "--> Let's re-build the cache for stages that changed"
         mapM_ (reBuildAssetStage app) stagesToReBuild -- Build each of the stages so they can be reused later
 
 -- | Returns a list of stages which needs to either be built separately or that did not have their cached busted
 --   by the introduction of new code.
-getChangedStages :: App -> Branch -> Dockerfile -> Shell [InspectedStage]
-getChangedStages app branch ast = do
+getChangedStages :: App -> Branch -> Maybe Branch -> Dockerfile -> Shell [StageCache]
+getChangedStages app branch fallbackBranch ast = do
     let mainFile = last (getStages ast) -- Parse all the FROM instructions in the dockerfile and only
                                         -- keep the last FROM, which is the main stage. Anything before that
                                         -- is considered a cacheable stage.
         assetStages = takeWhile (/= mainFile) (getStages ast) -- Filter out the main FROM at the end and only
                                                               -- keep the contents of the file before that instruction.
-        stages = mapMaybe (toStage app branch) assetStages -- For each the for found stages, before the main
-                                                           -- FROM instruction, convert them to Stage records
+        stages = mapMaybe (toStage app branch fallbackBranch) assetStages -- For each the for found stages, before the main
+                                                                           -- FROM instruction, convert them to Stage records
     when (length assetStages > length stages) showAliasesWarning
     fold
         (getAlreadyCached stages >>= -- Find the stages that we already have in local cache
-         inspectCache >>= -- Gather information to determine whether or not the cache was invalidated
          shouldBustCache -- Determine whether or not the cache was invalidated
          )
         Fold.list
@@ -215,28 +240,43 @@ getChangedStages app branch ast = do
 
 -- | Check whehther or not the imageName exists for each of the passed stages
 --   and return only those that already exist.
-getAlreadyCached :: [Stage SourceImage] -> Shell InspectedStage
+getAlreadyCached :: [Stage SourceImage] -> Shell StageCache
 getAlreadyCached stages = do
     echo "--> I'm checking whether or not the stage exists as a docker image already"
-    stage@Stage {buildImageName} <- select stages -- foreach stages as stage
-    let ImageName imageName = buildImageName -- Get the raw text value for the build image name
-    printLn ("----> Looking for image " %s) imageName
-    existent <-
-        fold
-            (inproc "docker" ["image", "ls", imageName, "--format", "{{.Repository}}"] empty)
-            Fold.list -- Get the output of the command as a list of lines
-    if existent == mempty
+    stage@Stage {buildImageName, stageFallbackImage} <- select stages -- foreach stages as stage
+    exists <- cacheKeyExists buildImageName
+    if exists
         then do
-            echo "------> It does not exist, so I will need to build it myself later"
-            return (NotCached stage)
-        else do
             echo "------> It already exists, so I will then check if the cache files changed"
-            return (CacheNotInspected stage)
+            inspectCache stage
+        else do
+            echo "------> It does not exist, so I will need to build it myself later"
+            maybe (return (NotCached stage)) (getFallbackCache stage) stageFallbackImage
+  where
+    cacheKeyExists (ImageName imageName) = do
+        printLn ("----> Looking for image " %s) imageName
+        existent <-
+            fold
+                (inproc "docker" ["image", "ls", imageName, "--format", "{{.Repository}}"] empty)
+                Fold.list -- Get the output of the command as a list of lines
+        return (existent /= mempty)
+    --
+    --
+    getFallbackCache stage fallbackName = do
+        exists <- cacheKeyExists fallbackName
+        if exists
+            then do
+                echo "------> The fallback image exists, using it to build the initial cache"
+                cachedStage <- inspectCache (stage {buildImageName = fallbackName})
+                return (FallbackCache stage cachedStage)
+            else do
+                echo "------> There is not fallback cache image"
+                return (NotCached stage)
 
 -- | This will inspect how an image was build and extrack the ONBUILD directives. If any of those
 --   instructions are copying or adding files to the build, they are considered "cache busters".
-inspectCache :: InspectedStage -> Shell InspectedStage
-inspectCache (CacheNotInspected sourceStage@Stage {..}) = do
+inspectCache :: Stage SourceImage -> Shell StageCache
+inspectCache sourceStage@Stage {..} = do
     history <- imageHistory buildImageName
     let onBuildLines = extractOnBuild history
         workdir = extractWorkdir history
@@ -267,21 +307,21 @@ inspectCache (CacheNotInspected sourceStage@Stage {..}) = do
     doExtract _ = Nothing
     getFirst (first:_) = first
     getFirst [] = []
--- In any other case return the same inspected stage
-inspectCache c@(NotCached _) = return c
-inspectCache c@(Cached _ _) = return c
-inspectCache c@(CacheInvalidated _) = return c
 
 toCachedStage :: Stage SourceImage -> Stage CachedImage
 toCachedStage Stage {..} =
     let stage = Stage {..}
         ImageName sImageName = stageImageName
         ImageName bImageName = buildImageName
-    in stage {stageImageName = ImageName sImageName, buildImageName = ImageName bImageName}
+    in stage
+       { stageImageName = ImageName sImageName
+       , stageFallbackImage = Nothing
+       , buildImageName = ImageName bImageName
+       }
 
 -- | Here check each of the cache buster from the image and compare them with those we have locally,
 --   if the files do not match, then we return the stage back as a result, otherwise return Nothing.
-shouldBustCache :: InspectedStage -> Shell InspectedStage
+shouldBustCache :: StageCache -> Shell StageCache
 shouldBustCache cached@Cached {..} = do
     printLn ("----> Checking cache buster files for stage " %s) (stageName stage)
     withContainer (buildImageName stage) checkFiles -- Create a container to inspect the files
@@ -318,9 +358,9 @@ shouldBustCache cached@Cached {..} = do
             then return Nothing
             else return (Just file)
 -- In any other case return the same inspected stage
-shouldBustCache c@(NotCached _) = return c
-shouldBustCache c@(CacheNotInspected _) = return c
-shouldBustCache c@(CacheInvalidated _) = return c
+shouldBustCache c@NotCached {} = return c
+shouldBustCache c@CacheInvalidated {} = return c
+shouldBustCache c@FallbackCache {} = return c
 
 -- | Creates a container from a stage and passes the container id to the
 --   given shell as an argument
@@ -356,9 +396,17 @@ reBuildAssetStage app Stage {..} = do
     printLn ("\n--> Rebuilding asset stage " %s % " at line " %d) stageName stagePos
     let fromInstruction =
             toDockerfile $ do
-                let ImageName t = buildImageName
+                let ImageName t = stageImageName
                 from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
     doStageBuild app stageImageName buildImageName fromInstruction
+
+reBuildFromFallback :: App -> Stage SourceImage -> Stage CachedImage -> Shell ()
+reBuildFromFallback app uncached cached = do
+    let fromInstruction =
+            toDockerfile $ do
+                let ImageName t = buildImageName cached
+                from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
+    doStageBuild app (stageImageName uncached) (buildImageName uncached) fromInstruction
 
 doStageBuild :: App -> ImageName a -> ImageName b -> Dockerfile -> Shell ()
 doStageBuild app sourceImageName targetImageName directives = do
@@ -378,7 +426,15 @@ buildDockerfile (App app) (ImageName imageName) buildOPtions directives = do
     tmpFile <- mktempfile currentDirectory "Dockerfile."
     let BuildOptions opts = fromMaybe (BuildOptions "") buildOPtions
     let allBuildOptions =
-            ["build", "--build-arg", "APP_NAME=" <> app, "-f", format fp tmpFile, "-t", imageName, "."] <>
+            [ "build"
+            , "--build-arg"
+            , "APP_NAME=" <> app
+            , "-f"
+            , format fp tmpFile
+            , "-t"
+            , imageName
+            , "."
+            ] <>
             [opts]
     liftIO (writeTextFile tmpFile (LT.toStrict (prettyPrint directives))) -- Put the Dockerfile contents in the tmp file
     shell ("docker " <> Text.intercalate " " allBuildOptions) empty -- Build the generated dockerfile
@@ -456,12 +512,14 @@ getStages ast = filter startsWithFROM (group ast [])
     startsWithFROM _ = False
 
 -- | Converts a list of instructions into a Stage record
-toStage :: App -> Branch -> Dockerfile -> Maybe (Stage a)
-toStage (App app) (Branch branch) directives = do
+toStage :: App -> Branch -> Maybe Branch -> Dockerfile -> Maybe (Stage a)
+toStage (App app) branch fallback directives = do
     (stageName, stagePos, stageAlias) <- extractInfo directives -- If getStageInfo returns Nothing, skip the rest
-    let tagName = app <> "__branch__" <> branch <> "__stage__" <> sanitize stageName
-        stageImageName = ImageName tagName
-        buildImageName = ImageName (tagName <> "-build")
+    let newImageName (Branch branchName) =
+            app <> "__branch__" <> branchName <> "__stage__" <> sanitize stageName
+        stageImageName = ImageName (newImageName branch)
+        buildImageName = ImageName (newImageName branch <> "-build")
+        stageFallbackImage = fmap (\br -> ImageName (newImageName br <> "-build")) fallback
     return Stage {..}
   where
     extractInfo :: Dockerfile -> Maybe (Text, Linenumber, Text)
