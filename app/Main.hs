@@ -492,6 +492,9 @@ extractOnBuild = doExtract
     findOnBuildLines = takeWhile isOnBuild . dropWhile (not . isOnBuild)
     isOnBuild line = Text.isPrefixOf onBuildPrefix (lineToText line)
 
+-- | Extracts the label from the cached image passed in the last argument and checks
+-- if it matches the passeed image name and tag name. This is used to avoid using a
+-- cached image tht was built using a different base iamge
 imageAndTagMatches :: ImageName Text -> Tag -> Text -> Shell Bool
 imageAndTagMatches (ImageName imageName) (Tag tagName) cachedImage = do
     printLn ("------> Checking the stored cached key in a label for " %s) cachedImage
