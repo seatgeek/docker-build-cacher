@@ -15,6 +15,7 @@ import Data.Text (Text)
 import qualified Data.Text.Lazy as LT
 import Filesystem.Path (FilePath)
 import Language.Docker hiding (workdir)
+import Language.Docker.Syntax (Tag(..))
 import Prelude hiding (FilePath)
 import Text.ParserCombinators.ReadP
 import Text.Read
@@ -48,11 +49,15 @@ newtype BuildOptions =
     BuildOptions Text
     deriving (Show)
 
+newtype CacheLabels =
+    CacheLabels [(Text, Text)]
+    deriving (Show)
+
 -- | A Stage is one of the FROM directives ina dockerfile
 --
 data Stage a = Stage
-    { stageName :: !Text -- ^ The image name, This is usually just the alias
-                        --
+    { stageName :: !Text -- ^ The image name, for example ubuntu in "ubuntu:16"
+    , stageTag :: !Text -- ^ The image tag, for example latest in "python:latest"
     , stageImageName :: !(ImageName a) -- ^ The name of the docker image to generate a separate cache for
                                        -- this is pretty much the "template" image to use for 'buildImageName'
                                        --
@@ -216,11 +221,8 @@ cacheBuild app branch fallbackBranch ast = do
 --   by the introduction of new code.
 getChangedStages :: App -> Branch -> Maybe Branch -> Dockerfile -> Shell [StageCache]
 getChangedStages app branch fallbackBranch ast = do
-    let mainFile = last (getStages ast) -- Parse all the FROM instructions in the dockerfile and only
-                                        -- keep the last FROM, which is the main stage. Anything before that
-                                        -- is considered a cacheable stage.
-        assetStages = takeWhile (/= mainFile) (getStages ast) -- Filter out the main FROM at the end and only
-                                                              -- keep the contents of the file before that instruction.
+    let assetStages = init (getStages ast) -- Filter out the main FROM at the end and only
+                                           -- keep the contents of the file before that instruction.
         stages = mapMaybe (toStage app branch fallbackBranch) assetStages -- For each the for found stages, before the main
                                                                            -- FROM instruction, convert them to Stage records
     when (length assetStages > length stages) showAliasesWarning
@@ -244,7 +246,7 @@ getAlreadyCached :: [Stage SourceImage] -> Shell StageCache
 getAlreadyCached stages = do
     echo "--> I'm checking whether or not the stage exists as a docker image already"
     stage@Stage {buildImageName, stageFallbackImage} <- select stages -- foreach stages as stage
-    exists <- cacheKeyExists buildImageName
+    exists <- cacheKeyExists stage buildImageName
     if exists
         then do
             echo "------> It already exists, so I will then check if the cache files changed"
@@ -253,21 +255,27 @@ getAlreadyCached stages = do
             echo "------> It does not exist, so I will need to build it myself later"
             maybe (return (NotCached stage)) (getFallbackCache stage) stageFallbackImage
   where
-    cacheKeyExists (ImageName imageName) = do
+    cacheKeyExists stage (ImageName imageName) = do
         printLn ("----> Looking for image " %s) imageName
         existent <-
             fold
                 (inproc "docker" ["image", "ls", imageName, "--format", "{{.Repository}}"] empty)
                 Fold.list -- Get the output of the command as a list of lines
-        return (existent /= mempty)
+        if existent == mempty
+            then return False
+                -- For the cache to be valid, we need to make sure that the stored image is based on the same
+                -- base image and tag. Otherwise we will need to rebuild the cache anyway
+            else imageAndTagMatches (ImageName (stageName stage)) (Tag (stageTag stage)) imageName
     --
     --
     getFallbackCache stage fallbackName = do
-        exists <- cacheKeyExists fallbackName
+        exists <- cacheKeyExists stage fallbackName
         if exists
             then do
                 echo "------> The fallback image exists, using it to build the initial cache"
-                cachedStage <- inspectCache (stage {buildImageName = fallbackName})
+                cachedStage <-
+                    inspectCache
+                        (stage {stageImageName = fallbackName, buildImageName = fallbackName})
                 return (FallbackCache stage cachedStage)
             else do
                 echo "------> There is not fallback cache image"
@@ -382,8 +390,13 @@ buildAssetStage app Stage {..} = do
         ("\n--> Building asset stage " %s % " at line " %d % " for the first time")
         stageName
         stagePos
-    let filteredDirectives = filter isFrom directives
-    doStageBuild app stageImageName buildImageName filteredDirectives
+    let fromInstruction = filter isFrom directives
+        cacheLabels = [("cached_image", stageName <> ":" <> stageTag)]
+        newDockerfile =
+            toDockerfile $ do
+                embed fromInstruction
+                label cacheLabels
+    doStageBuild app stageImageName buildImageName (CacheLabels cacheLabels) newDockerfile
   where
     isFrom (InstructionPos (From _) _ _) = True
     isFrom _ = False
@@ -394,26 +407,35 @@ buildAssetStage app Stage {..} = do
 reBuildAssetStage :: App -> Stage CachedImage -> Shell ()
 reBuildAssetStage app Stage {..} = do
     printLn ("\n--> Rebuilding asset stage " %s % " at line " %d) stageName stagePos
-    let fromInstruction =
+    let cacheLabels = [("cached_image", stageName <> ":" <> stageTag)]
+        newDockerfile =
             toDockerfile $ do
                 let ImageName t = stageImageName
                 from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
-    doStageBuild app stageImageName buildImageName fromInstruction
+                label cacheLabels
+    doStageBuild app stageImageName buildImageName (CacheLabels cacheLabels) newDockerfile
 
 reBuildFromFallback :: App -> Stage SourceImage -> Stage CachedImage -> Shell ()
 reBuildFromFallback app uncached cached = do
-    let fromInstruction =
+    let cacheLabels = [("cached_image", stageName uncached <> ":" <> stageTag uncached)]
+        newDockerfile =
             toDockerfile $ do
                 let ImageName t = buildImageName cached
                 from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
-    doStageBuild app (stageImageName uncached) (buildImageName uncached) fromInstruction
+                label cacheLabels
+    doStageBuild
+        app
+        (stageImageName uncached)
+        (buildImageName uncached)
+        (CacheLabels cacheLabels)
+        newDockerfile
 
-doStageBuild :: App -> ImageName a -> ImageName b -> Dockerfile -> Shell ()
-doStageBuild app sourceImageName targetImageName directives = do
+doStageBuild :: App -> ImageName a -> ImageName b -> CacheLabels -> Dockerfile -> Shell ()
+doStageBuild app sourceImageName targetImageName cacheLabels directives = do
     status <- buildDockerfile app sourceImageName Nothing directives -- Only build the FROM
     guard (status == ExitSuccess) -- Break if previous command failed
     history <- imageHistory sourceImageName -- Get the commands used to build the docker image
-    newDockerfile <- createDockerfile sourceImageName (extractOnBuild history) -- Append the ONBUILD lines to the new file
+    newDockerfile <- createDockerfile sourceImageName cacheLabels (extractOnBuild history) -- Append the ONBUILD lines to the new file
     finalStatus <- buildDockerfile app targetImageName Nothing newDockerfile -- Now build it
     guard (finalStatus == ExitSuccess) -- Stop here if previous command failed
     echo ""
@@ -441,13 +463,14 @@ buildDockerfile (App app) (ImageName imageName) buildOPtions directives = do
 
 -- | Given a list of instructions, build a dockerfile where the imageName is the FROM for the file and
 --   the list of instructions are wrapped with ONBUILD
-createDockerfile :: ImageName a -> [Text] -> Shell Dockerfile
-createDockerfile (ImageName imageName) onBuildLines = do
+createDockerfile :: ImageName a -> CacheLabels -> [Text] -> Shell Dockerfile
+createDockerfile (ImageName imageName) (CacheLabels cacheLabels) onBuildLines = do
     let eitherDirectives = map parseText onBuildLines
         validDirectives = rights eitherDirectives -- Just in case, filter out bad directives
         file =
             toDockerfile $ do
                 from $ toImage imageName `tagged` "latest"
+                label cacheLabels
                 mapM (onBuildRaw . toInstruction) validDirectives -- Append each of the ONBUILD instructions
     return file
   where
@@ -468,6 +491,19 @@ extractOnBuild = doExtract
     --   Arguments flow from right to left in the functions chain
     findOnBuildLines = takeWhile isOnBuild . dropWhile (not . isOnBuild)
     isOnBuild line = Text.isPrefixOf onBuildPrefix (lineToText line)
+
+imageAndTagMatches :: ImageName Text -> Tag -> Text -> Shell Bool
+imageAndTagMatches (ImageName imageName) (Tag tagName) cachedImage = do
+    printLn ("------> Checking the stored cached key in a label for " %s) cachedImage
+    value <- fold getCacheLabel Fold.head -- Get the only line
+    let expected = unsafeTextToLine (imageName <> ":" <> tagName)
+    return (Just expected == value)
+  where
+    getCacheLabel =
+        inproc
+            "docker"
+            ["inspect", "--format", "{{ index .Config.Labels \"cached_image\"}}", cachedImage]
+            empty
 
 extractWorkdir :: [Line] -> FilePath
 extractWorkdir instructions =
@@ -514,7 +550,7 @@ getStages ast = filter startsWithFROM (group ast [])
 -- | Converts a list of instructions into a Stage record
 toStage :: App -> Branch -> Maybe Branch -> Dockerfile -> Maybe (Stage a)
 toStage (App app) branch fallback directives = do
-    (stageName, stagePos, stageAlias) <- extractInfo directives -- If getStageInfo returns Nothing, skip the rest
+    (stageName, stageTag, stagePos, stageAlias) <- extractInfo directives -- If getStageInfo returns Nothing, skip the rest
     let newImageName (Branch branchName) =
             app <> "__branch__" <> branchName <> "__stage__" <> sanitize stageName
         stageImageName = ImageName (newImageName branch)
@@ -522,16 +558,16 @@ toStage (App app) branch fallback directives = do
         stageFallbackImage = fmap (\br -> ImageName (newImageName br <> "-build")) fallback
     return Stage {..}
   where
-    extractInfo :: Dockerfile -> Maybe (Text, Linenumber, Text)
+    extractInfo :: Dockerfile -> Maybe (Text, Text, Linenumber, Text)
     extractInfo (InstructionPos {instruction, lineNumber}:_) = getStageInfo instruction lineNumber
     extractInfo _ = Nothing
-    getStageInfo :: Instruction Text -> Linenumber -> Maybe (Text, Linenumber, Text)
-    getStageInfo (From (TaggedImage Image {imageName} _ (Just (ImageAlias alias)))) pos =
-        Just (imageName, pos, alias)
+    getStageInfo :: Instruction Text -> Linenumber -> Maybe (Text, Text, Linenumber, Text)
+    getStageInfo (From (TaggedImage Image {imageName} (Tag tag) (Just (ImageAlias alias)))) pos =
+        Just (imageName, tag, pos, alias)
     getStageInfo (From (UntaggedImage Image {imageName} (Just (ImageAlias alias)))) pos =
-        Just (imageName, pos, alias)
-    getStageInfo (From (DigestedImage Image {imageName} _ (Just (ImageAlias alias)))) pos =
-        Just (imageName, pos, alias)
+        Just (imageName, "latest", pos, alias)
+    getStageInfo (From (DigestedImage Image {imageName} tag (Just (ImageAlias alias)))) pos =
+        Just (imageName, tag, pos, alias)
     getStageInfo _ _ = Nothing
     --
     -- | Makes a string safe to use it as a file name
