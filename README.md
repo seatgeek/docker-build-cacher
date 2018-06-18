@@ -82,8 +82,13 @@ your Dockerfile:
 This utility has two modes, `Build` and `Cache`. Both modes should be invoked for the cache to work:
 
 ```bash
+# APP_NAME ispassed as argument in the build process, you can use it as an env var in your Dockerfile
 export APP_NAME=fancyapp
+
+# GIT_BRANCH is used as part of the named for the resulting cached image
 export GIT_BRANCH=master
+
+# DOCKER_TAG corresponds to the -t argument in docker build, that will be the resulting image name
 export DOCKER_TAG=fancyapp:latest
 
 docker-build-cacher build # This will build the docker file
@@ -99,6 +104,28 @@ DOCKERFILE=buildfiles/Dockerfile docker-build-cacher build
 
 At the end of the process you can call `docker images` and see that it has created `fancyapp:latest`, and if you are using
 multi-stage builds, it should have created an image tag for each of the stages in your Dockerfile
+
+### Fallback Cache Keys
+
+
+As mentioned before the `GIT_BRANCH` env variable is used as part of the name for the generated cached image, this means that
+the generated cache is scope to that name. This is done so you can keep different caches where you can experiment with widly
+different requirements and libraries in the dockerfile.
+
+This has the unfortunate side effect that building other branches will require building the cache from scratch. In order to solve this
+you can use the `FALLBACK_BRANCH` environment variable like this:
+
+```bash
+export APP_NAME=fancyapp
+export GIT_BRANCH=my-feature
+export FALLBACK_BRANCH=master
+export DOCKER_TAG=fancyapp:latest
+
+docker-build-cacher build
+docker-build-cacher cache
+```
+
+The above will make the cached image for the `my-feature` branch to be based on the one from the `master` branch.
 
 ## How It Works
 
