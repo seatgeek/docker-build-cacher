@@ -22,6 +22,7 @@ dependencies:
   - foldl
   - text
   - system-filepath
+  - aeson
 
 executables:
   docker-build-cacher:

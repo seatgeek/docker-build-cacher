@@ -6,14 +6,16 @@ module Main where
 
 import qualified Control.Foldl as Fold
 import Control.Monad (guard, when)
+import qualified Data.Aeson as Aeson
+import Data.Aeson ((.:))
 import Data.Either (rights)
 import Data.List.NonEmpty (toList)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text (Text)
+import qualified Data.Text.Encoding
 import qualified Data.Text.Lazy as LT
-import Filesystem.Path (FilePath)
 import Language.Docker hiding (workdir)
 import Language.Docker.Syntax (Tag(..))
 import Prelude hiding (FilePath)
@@ -82,6 +84,20 @@ data StageCache
               }
     | CacheInvalidated (Stage CachedImage)
     deriving (Show)
+
+-- | This represents the image config as stored on disk by the docker daemon. We only care here
+-- about the .Config.WorkingDir and .Config.OnBuild properties
+data ImageConfig = ImageConfig
+    { workingDir :: Text
+    , onBuildInstructions :: [Text]
+    } deriving (Show, Eq)
+
+instance Aeson.FromJSON ImageConfig where
+    parseJSON =
+        Aeson.withObject "ImageConfig" $ \ic -> do
+            workingDir <- ic .: "WorkingDir"
+            onBuildInstructions <- fromMaybe [] <$> ic .: "OnBuild"
+            return $ ImageConfig {..}
 
 -- | This script has 2 modes. One for building the Dockerfile, and another for caching its stages
 data Mode
@@ -285,12 +301,10 @@ getAlreadyCached stages = do
 --   instructions are copying or adding files to the build, they are considered "cache busters".
 inspectCache :: Stage SourceImage -> Shell StageCache
 inspectCache sourceStage@Stage {..} = do
-    history <- imageHistory buildImageName
-    let onBuildLines = extractOnBuild history
-        workdir = extractWorkdir history
-        parsedDirectivesWithErrors = fmap parseText onBuildLines -- Parse each of the lines
+    ImageConfig workdir onBuildLines <- imageConfig buildImageName
+    let parsedDirectivesWithErrors = fmap parseText onBuildLines -- Parse each of the lines
         parsedDirectives = (getFirst . rights) parsedDirectivesWithErrors -- We only keep the good lines
-        cacheBusters = extractCachePaths workdir parsedDirectives
+        cacheBusters = extractCachePaths (fromText workdir) parsedDirectives
     return $ Cached (toCachedStage sourceStage) cacheBusters
   where
     extractCachePaths workdir dir =
@@ -391,15 +405,30 @@ buildAssetStage app Stage {..} = do
         stageName
         stagePos
     let fromInstruction = filter isFrom directives
+        sourceImage = ImageName (extractFullName fromInstruction)
         cacheLabels = [("cached_image", stageName <> ":" <> stageTag)]
         newDockerfile =
             toDockerfile $ do
                 embed fromInstruction
                 label cacheLabels
-    doStageBuild app stageImageName buildImageName (CacheLabels cacheLabels) newDockerfile
+    doStageBuild
+        app
+        sourceImage
+        stageImageName
+        buildImageName
+        (CacheLabels cacheLabels)
+        newDockerfile
   where
     isFrom (InstructionPos (From _) _ _) = True
     isFrom _ = False
+    extractFullName (instr:_) = extractFromInstr (instruction instr)
+    extractFullName _ = ""
+    extractFromInstr (From (DigestedImage img digest _)) = prettyImage img <> "@" <> digest
+    extractFromInstr (From (UntaggedImage img _)) = prettyImage img
+    extractFromInstr (From (TaggedImage img (Tag tag) _)) = prettyImage img <> ":" <> tag
+    extractFromInstr _ = ""
+    prettyImage (Image Nothing img) = img
+    prettyImage (Image (Just (Registry reg)) img) = reg <> "/" <> img
 
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image
@@ -408,34 +437,48 @@ reBuildAssetStage :: App -> Stage CachedImage -> Shell ()
 reBuildAssetStage app Stage {..} = do
     printLn ("\n--> Rebuilding asset stage " %s % " at line " %d) stageName stagePos
     let cacheLabels = [("cached_image", stageName <> ":" <> stageTag)]
+    let ImageName t = stageImageName
         newDockerfile =
             toDockerfile $ do
-                let ImageName t = stageImageName
-                from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
-                label cacheLabels
-    doStageBuild app stageImageName buildImageName (CacheLabels cacheLabels) newDockerfile
-
-reBuildFromFallback :: App -> Stage SourceImage -> Stage CachedImage -> Shell ()
-reBuildFromFallback app uncached cached = do
-    let cacheLabels = [("cached_image", stageName uncached <> ":" <> stageTag uncached)]
-        newDockerfile =
-            toDockerfile $ do
-                let ImageName t = buildImageName cached
                 from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
                 label cacheLabels
     doStageBuild
         app
+        buildImageName -- The source image is the one having the ONBUILD lines
+        stageImageName
+        buildImageName
+        (CacheLabels cacheLabels)
+        newDockerfile
+
+reBuildFromFallback :: App -> Stage SourceImage -> Stage CachedImage -> Shell ()
+reBuildFromFallback app uncached cached = do
+    let cacheLabels = [("cached_image", stageName uncached <> ":" <> stageTag uncached)]
+    let sourceImage@(ImageName t) = buildImageName cached
+        newDockerfile =
+            toDockerfile $ do
+                from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
+                label cacheLabels
+    doStageBuild
+        app
+        sourceImage
         (stageImageName uncached)
         (buildImageName uncached)
         (CacheLabels cacheLabels)
         newDockerfile
 
-doStageBuild :: App -> ImageName a -> ImageName b -> CacheLabels -> Dockerfile -> Shell ()
-doStageBuild app sourceImageName targetImageName cacheLabels directives = do
-    status <- buildDockerfile app sourceImageName Nothing directives -- Only build the FROM
+doStageBuild ::
+       App
+    -> ImageName source -- ^ This is the image potentially containing the ONBUILD lines, this image needs to exist
+    -> ImageName intermediate -- ^ This is the image name to build as intermediate with no ONBUILD
+    -> ImageName target -- ^ This is the final image name to build, after appending the ONBUILD lines to intermediate
+    -> CacheLabels
+    -> Dockerfile
+    -> Shell ()
+doStageBuild app sourceImageName intermediateImage targetImageName cacheLabels directives = do
+    status <- buildDockerfile app intermediateImage Nothing directives -- Only build the FROM
     guard (status == ExitSuccess) -- Break if previous command failed
-    history <- imageHistory sourceImageName -- Get the commands used to build the docker image
-    newDockerfile <- createDockerfile sourceImageName cacheLabels (extractOnBuild history) -- Append the ONBUILD lines to the new file
+    ImageConfig _ onBuildLines <- imageConfig sourceImageName
+    newDockerfile <- createDockerfile intermediateImage cacheLabels onBuildLines -- Append the ONBUILD lines to the new file
     finalStatus <- buildDockerfile app targetImageName Nothing newDockerfile -- Now build it
     guard (finalStatus == ExitSuccess) -- Stop here if previous command failed
     echo ""
@@ -477,21 +520,6 @@ createDockerfile (ImageName imageName) (CacheLabels cacheLabels) onBuildLines = 
     toInstruction [InstructionPos inst _ _] = inst
     toInstruction _ = error "This is not possible"
 
--- | Extracts the list of instructions appearing in ONBUILD for a given docker history for a tag
-extractOnBuild :: [Line] -> [Text]
-extractOnBuild = doExtract
-  where
-    onBuildPrefix = "/bin/sh -c #(nop)  ONBUILD "
-    --
-    -- | First get the ONBUILD lines then strip the common prefix out of each.
-    --   Arguments flow from right to left in the functions chain
-    doExtract = mapMaybe (Text.stripPrefix onBuildPrefix . lineToText) . findOnBuildLines
-    --
-    -- | First drop the lines not starting with ONBUILD, then take only those.
-    --   Arguments flow from right to left in the functions chain
-    findOnBuildLines = takeWhile isOnBuild . dropWhile (not . isOnBuild)
-    isOnBuild line = Text.isPrefixOf onBuildPrefix (lineToText line)
-
 -- | Extracts the label from the cached image passed in the last argument and checks
 -- if it matches the passeed image name and tag name. This is used to avoid using a
 -- cached image tht was built using a different base iamge
@@ -508,32 +536,19 @@ imageAndTagMatches (ImageName imageName) (Tag tagName) cachedImage = do
             ["inspect", "--format", "{{ index .Config.Labels \"cached_image\"}}", cachedImage]
             empty
 
-extractWorkdir :: [Line] -> FilePath
-extractWorkdir instructions =
-    case reverse (doExtract instructions) of
-        [] -> fromText "/"
-        lastWorkdir:_ -> fromText lastWorkdir -- We are on;y intereted in the latest WORKDIR declared
+-- | Calls docker inspect for the given image name and returns the config
+imageConfig :: ImageName a -> Shell ImageConfig
+imageConfig (ImageName name) = do
+    printLn ("----> Inspecting the config for the docker image: " %s) name
+    out <- fmap lineToText <$> fold fetchConfig Fold.list -- Buffer all the output in the out variable
+    case decodeJSON out of
+        Left decodeErr -> do
+            error $ "----> Could not decode the response of docker inspect: " ++ decodeErr
+            return (ImageConfig "" [])
+        Right ic -> return ic
   where
-    onBuildPrefix = "/bin/sh -c #(nop)  ONBUILD " -- Curiously, ONBUILD is lead by 2 spaces
-    workdirPrefix = "/bin/sh -c #(nop) WORKDIR " -- Whereas WORKDIR only by one space
-    --
-    -- | First find all relevant instructions, then keep the lines starting with the workdir prefix
-    doExtract = mapMaybe (Text.stripPrefix workdirPrefix . lineToText) . findRelevantLines
-    --
-    -- | Take lines until a ONBUILD is found
-    --   Arguments flow from right to left in the functions chain
-    findRelevantLines = takeWhile (not . isOnBuild)
-    isOnBuild line = Text.isPrefixOf onBuildPrefix (lineToText line)
-
--- | Calls docker history for the given image name and returns the output as a list
-imageHistory :: ImageName a -> Shell [Line]
-imageHistory (ImageName name) = do
-    printLn ("----> Checking the docker image history for " %s) name
-    out <- fold fetchHistory Fold.list -- Buffer all the output of the imageHistory shell
-    return (reverse out) -- The history comes in reverse order, sort it naturally
-  where
-    fetchHistory =
-        inproc "docker" ["history", "--no-trunc", "--format", "{{.CreatedBy}}", name] empty
+    fetchConfig = inproc "docker" ["inspect", "--format", "{{.Config | json}}", name] empty
+    decodeJSON = Aeson.eitherDecodeStrict . Data.Text.Encoding.encodeUtf8 . Text.unlines
 
 --
 -- | Returns a list of directives grouped by the appeareance of the FROM directive
