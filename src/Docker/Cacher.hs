@@ -180,6 +180,7 @@ buildAssetStage app Stage {..} = do
       newDockerfile   = toDockerfile $ do
         embed directives
         label (Data.Coerce.coerce cacheLabels)
+  liftIO $ print (prettyPrintDockerfile newDockerfile)
   doStageBuild app
                sourceImage
                stageImageName
@@ -423,8 +424,22 @@ buildCacheLabels imageName imageTag files = CacheLabels
   plainTextList = Data.Coerce.coerce files
 
 
+canCacheDirectives :: Dockerfile -> Bool
+canCacheDirectives df = not (null cacheLabels)
+ where
+  cacheLabels =
+    [ True
+    | Label pairs <- map instruction df
+    , (key, val)  <- pairs
+    , key == "cache_instructions"
+    , val == "cache"
+    ]
+
+
 cacheableDirectives :: Dockerfile -> Dockerfile
-cacheableDirectives = filter (not . isFrom) . filter (not . isOnBuild)
+cacheableDirectives df = if canCacheDirectives df
+  then filter (not . isFrom) . filter (not . isOnBuild) $ df
+  else []
 
 
 cacheableDockerFile :: Text -> Dockerfile -> CacheLabels -> Dockerfile
