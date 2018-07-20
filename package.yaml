@@ -24,10 +24,18 @@ dependencies:
   - system-filepath
   - aeson
 
+library:
+  source-dirs: src
+  ghc-options:
+    - -Wall
+    - -fno-warn-unused-do-bind
+
 executables:
   docker-build-cacher:
     main: Main.hs
     source-dirs: app
+    dependencies:
+      - docker-build-cacher
     ghc-options:
     - -threaded
     - -rtsopts
