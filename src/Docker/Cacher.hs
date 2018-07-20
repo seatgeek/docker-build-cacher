@@ -49,6 +49,7 @@ newtype CacheLabels =
     CacheLabels [(Text, Text)]
     deriving (Show)
 
+
 -- | Builds the provided Dockerfile. If it is a multi-stage build, check if those stages are already cached
 --   and change the dockerfile to take advantage of that.
 buildFromCache
@@ -71,6 +72,7 @@ buildFromCache app branch fallbackBranch imageName buildOptions ast = do
 
   build app imageName buildOptions cachedStages
 
+
 build
   :: App
   -> ImageName SourceImage
@@ -89,6 +91,7 @@ build app imageName buildOptions ast = do
       echo
         "I built the main dockerfile without a problem. Now call this same script with the `Cache` mode"
     ExitFailure _ -> die "Boo, I could not build the project"
+
 
 -- | One a dockefile is built, we can extract each of the stages separately and then tag them, so the cache
 -- can be retreived at a later point.
@@ -116,6 +119,7 @@ cacheBuild app branch fallbackBranch ast = do
   when (stagesToReBuild /= []) $ do
     echo "--> Let's re-build the cache for stages that changed"
     mapM_ (reBuildAssetStage app) stagesToReBuild -- Build each of the stages so they can be reused later
+
 
 -- | Returns a list of stages which needs to either be built separately or that did not have their cached busted
 --   by the introduction of new code.
@@ -151,6 +155,7 @@ getChangedStages app branch fallbackBranch ast = do
     echo ""
     echo
       "Please always write your FROM directives as `FROM image:tag as myalias`"
+
 
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image
@@ -191,6 +196,7 @@ buildAssetStage app Stage {..} = do
   prettyImage (Image Nothing               img) = img
   prettyImage (Image (Just (Registry reg)) img) = reg <> "/" <> img
 
+
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image
 --   so we can find it later.
@@ -226,6 +232,7 @@ reBuildFromFallback app uncached cached = do
                (CacheLabels cacheLabels)
                newDockerfile
 
+
 doStageBuild
   :: App
   -> ImageName source -- ^ This is the image potentially containing the ONBUILD lines, this image needs to exist
@@ -236,8 +243,12 @@ doStageBuild
   -> Shell ()
 doStageBuild app sourceImageName intermediateImage targetImageName cacheLabels directives
   = do
-    status <- buildDockerfile app intermediateImage Nothing directives -- Only build the FROM
-    guard (status == ExitSuccess) -- Break if previous command failed
+    -- Only build the FROM
+    status <- buildDockerfile app intermediateImage Nothing directives
+
+    -- Break if previous command failed
+    guard (status == ExitSuccess)
+
     ImageConfig _ onBuildLines <- Docker.Cacher.Inspect.imageConfig
       sourceImageName
 
@@ -252,6 +263,7 @@ doStageBuild app sourceImageName intermediateImage targetImageName cacheLabels d
     echo ""
     echo
       "--> I have tagged a cache container that I can use next time to speed builds!"
+
 
 -- | Simply call docker build for the passed arguments
 buildDockerfile
@@ -278,6 +290,7 @@ buildDockerfile (App app) (ImageName imageName) buildOPtions directives = do
   -- Build the generated dockerfile
   shell ("docker " <> Text.intercalate " " allBuildOptions) empty
 
+
 -- | Given a list of instructions, build a dockerfile where the imageName is the FROM for the file and
 --   the list of instructions are wrapped with ONBUILD
 createDockerfile :: ImageName a -> CacheLabels -> [Text] -> Shell Dockerfile
@@ -294,6 +307,7 @@ createDockerfile (ImageName imageName) (CacheLabels cacheLabels) onBuildLines =
  where
   toInstruction [InstructionPos inst _ _] = inst
   toInstruction _                         = error "This is not possible"
+
 
 --
 -- | Returns a list of directives grouped by the appeareance of the FROM directive
@@ -312,6 +326,7 @@ getStages ast = filter startsWithFROM (group ast [])
   -- | Returns true if the first element in the list is a FROM directive
   startsWithFROM (InstructionPos (From _) _ _ : _) = True
   startsWithFROM _ = False
+
 
 -- | Converts a list of instructions into a Stage record
 toStage :: App -> Branch -> Maybe Branch -> Dockerfile -> Maybe (Stage a)
@@ -344,6 +359,7 @@ toStage (App app) branch fallback directives = do
   -- | Makes a string safe to use it as a file name
   sanitize = Text.replace "/" "-" . Text.replace ":" "-"
 
+
 -- | Given a list of stages and the AST for a Dockerfile, replace all the FROM instructions
 --   with their corresponding images as described in the Stage record.
 replaceStages :: [Stage CachedImage] -> Dockerfile -> Dockerfile
@@ -373,6 +389,7 @@ replaceStages stages = fmap
         in  From (TaggedImage (toImage t) "latest" (formatAlias stageAlias))
 
   formatAlias = Just . fromString . Text.unpack
+
 
 toImage :: Text -> Image
 toImage = fromString . Text.unpack

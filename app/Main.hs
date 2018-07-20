@@ -40,6 +40,7 @@ data Args = Args
     , noBuildCache :: Bool
     }
 
+
 -- | Describes the arguments this script takes from the command line
 parser :: Parser Args
 parser =
@@ -52,6 +53,7 @@ parser =
     <*> switch "no-cache-build"
                'n'
                "Skip the internal docker cache when building the image"
+
 
 main :: IO ()
 main = do
@@ -107,6 +109,7 @@ main = do
                                           buildOPtions
                                           ast
             )
+
 
 needEnv :: MonadIO m => Text -> m Text
 needEnv varName = do

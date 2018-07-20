@@ -47,6 +47,7 @@ instance Aeson.FromJSON ImageConfig where
             onBuildInstructions <- fromMaybe [] <$> ic .: "OnBuild"
             return $ ImageConfig {..}
 
+
 -- | Calls docker inspect for the given image name and returns the config
 imageConfig :: ImageName a -> Shell ImageConfig
 imageConfig (ImageName name) = do
@@ -66,6 +67,7 @@ imageConfig (ImageName name) = do
     inproc "docker" ["inspect", "--format", "{{.Config | json}}", name] empty
   decodeJSON =
     Aeson.eitherDecodeStrict . Data.Text.Encoding.encodeUtf8 . Text.unlines
+
 
 -- | Check whether or not the imageName exists for each of the passed stages
 --   and return only those that already exist.
@@ -124,6 +126,7 @@ getAlreadyCached stages = do
         echo "------> There is not fallback cache image"
         return (NotCached stage)
 
+
 -- | Here check each of the cache buster from the image and compare them with those we have locally,
 --   if the files do not match, then we return the stage back as a result, otherwise return Nothing.
 shouldBustCache :: StageCache -> Shell StageCache
@@ -170,6 +173,7 @@ shouldBustCache c@NotCached{}        = return c
 shouldBustCache c@CacheInvalidated{} = return c
 shouldBustCache c@FallbackCache{}    = return c
 
+
 -- | This will inspect how an image was build and extrack the ONBUILD directives. If any of those
 --   instructions are copying or adding files to the build, they are considered "cache busters".
 inspectCache :: Stage SourceImage -> Shell StageCache
@@ -206,6 +210,7 @@ inspectCache sourceStage@Stage {..} = do
   getFirst (first : _) = first
   getFirst []          = []
 
+
 toCachedStage :: Stage SourceImage -> Stage CachedImage
 toCachedStage Stage {..} =
   let stage                = Stage {..}
@@ -215,6 +220,7 @@ toCachedStage Stage {..} =
             , stageFallbackImage = Nothing
             , buildImageName     = ImageName bImageName
             }
+
 
 -- | Extracts the label from the cached image passed in the last argument and checks
 -- if it matches the passeed image name and tag name. This is used to avoid using a
@@ -236,6 +242,7 @@ imageAndTagMatches (ImageName imageName) (Tag tagName) cachedImage = do
     ]
     empty
 
+
 alreadyCached :: StageCache -> Maybe (Stage CachedImage)
 -- We want to replace stages where the cache
 -- was invalidated by any file changes.
@@ -252,6 +259,7 @@ alreadyCached (FallbackCache _ (CacheInvalidated stage)) = Just stage
 alreadyCached (FallbackCache _ (Cached stage _)) = Just stage
 
 alreadyCached _ = Nothing
+
 
 -- | Creates a container from a stage and passes the container id to the
 --   given shell as an argument
