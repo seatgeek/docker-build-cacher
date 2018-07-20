@@ -7,12 +7,14 @@ module Docker.Cacher.Inspect where
 import qualified Control.Foldl                 as Fold
 import qualified Data.Aeson                    as Aeson
 import           Data.Aeson                     ( (.:) )
+import qualified Data.Coerce
 import           Data.Either                    ( rights )
 import           Data.List.NonEmpty             ( toList )
 import           Data.Maybe                     ( fromMaybe
                                                 , isJust
                                                 , mapMaybe
                                                 )
+import qualified Data.Map                      as Map
 import qualified Data.Text                     as Text
 import           Data.Text                      ( Text )
 import qualified Data.Text.Encoding
@@ -26,8 +28,9 @@ import           Docker.Cacher.Internal
 -- | This represents the image config as stored on disk by the docker daemon. We only care here
 -- about the .Config.WorkingDir and .Config.OnBuild properties
 data ImageConfig = ImageConfig
-    { workingDir :: Text
-    , onBuildInstructions :: [Text]
+    { workingDir :: !Text
+    , onBuildInstructions :: ![Text]
+    , storedLabels :: !(Map.Map Text Text)
     } deriving (Show, Eq)
 
 data StageCache
@@ -45,6 +48,7 @@ instance Aeson.FromJSON ImageConfig where
         Aeson.withObject "ImageConfig" $ \ic -> do
             workingDir <- ic .: "WorkingDir"
             onBuildInstructions <- fromMaybe [] <$> ic .: "OnBuild"
+            storedLabels <- fromMaybe Map.empty <$> ic .: "Labels"
             return $ ImageConfig {..}
 
 
@@ -59,7 +63,7 @@ imageConfig (ImageName name) = do
       error
         $  "----> Could not decode the response of docker inspect: "
         ++ decodeErr
-      return (ImageConfig "" [])
+      return (ImageConfig "" [] Map.empty)
 
     Right ic -> return ic
  where
@@ -153,22 +157,37 @@ shouldBustCache sourceStage cached@Cached {..} = do
   -- |
   checkFileChanged containerId files = do
     (SourcePath src, TargetPath dest) <- select files
-    let file      = fromText src
-    let targetDir = fromText dest
-    printLn ("------> Checking file '" % fp % "' in directory " % fp)
-            file
-            targetDir
-    currentDirectory <- pwd
-    tempFile         <- mktempfile currentDirectory "comp"
-    let targetFile = targetDir </> file
-    status <- proc
-      "docker"
-      ["cp", format (s % ":" % fp) containerId targetFile, format fp tempFile]
-      empty
-    guard (status == ExitSuccess)
-    local  <- liftIO (readTextFile file)
-    remote <- liftIO (readTextFile tempFile)
-    if local == remote then return Nothing else return (Just file)
+    let file = fromText src
+    fileStat <- stat file
+
+    if isDirectory fileStat
+      then do
+        printLn
+          ("------>'" % fp % "' is a directory, assuming files inside it changed")
+          file
+        return $ Just file
+      else do
+        let targetDir = fromText dest
+        printLn ("------> Checking file '" % fp % "' in directory " % fp)
+                file
+                targetDir
+        currentDirectory <- pwd
+        tempFile         <- mktempfile currentDirectory "comp"
+        let targetFile = targetDir </> file
+        status <- proc
+          "docker"
+          [ "cp"
+          , format (s % ":" % fp) containerId targetFile
+          , format fp tempFile
+          ]
+          empty
+
+        guard (status == ExitSuccess)
+
+        local  <- liftIO (readTextFile file)
+        remote <- liftIO (readTextFile tempFile)
+        if local == remote then return Nothing else return (Just file)
+
 -- In any other case return the same inspected stage
 shouldBustCache _ c@NotCached{}        = return c
 shouldBustCache _ c@CacheInvalidated{} = return c
@@ -179,10 +198,12 @@ shouldBustCache _ c@FallbackCache{}    = return c
 --   instructions are copying or adding files to the build, they are considered "cache busters".
 inspectCache :: Stage SourceImage -> Shell StageCache
 inspectCache sourceStage@Stage {..} = do
-  ImageConfig workdir onBuildLines <- imageConfig buildImageName
+  ImageConfig workdir onBuildLines foundLabels <- imageConfig buildImageName
   let parsedDirectivesWithErrors = fmap parseText onBuildLines -- Parse each of the lines
       parsedDirectives = (getFirst . rights) parsedDirectivesWithErrors -- We only keep the good lines
-      cacheBusters = extractCachePaths (fromText workdir) parsedDirectives
+      workPath = fromText workdir
+      onBuildBusters = extractCachePaths workPath parsedDirectives
+      cacheBusters = onBuildBusters ++ bustersFromLabels workPath foundLabels
   return $ Cached (toCachedStage sourceStage) cacheBusters
  where
   extractCachePaths workdir dir =
@@ -210,6 +231,18 @@ inspectCache sourceStage@Stage {..} = do
 
   getFirst (first : _) = first
   getFirst []          = []
+
+  bustersFromLabels workdir labelList =
+    case Map.lookup "cached_files" labelList of
+      Nothing -> []
+      Just fs ->
+        case
+            Aeson.decodeStrict . Data.Text.Encoding.encodeUtf8 $ fs :: Maybe
+              [(Text, Text)]
+          of
+            Nothing -> []
+            Just busters ->
+              fmap (prependWorkdir workdir) (Data.Coerce.coerce busters)
 
 
 toCachedStage :: Stage SourceImage -> Stage CachedImage

@@ -173,14 +173,19 @@ buildAssetStage app Stage {..} = do
     )
     stageName
     stagePos
-  let fromInstruction = filter isFrom directives
-      sourceImage     = ImageName (extractFullName fromInstruction)
-      embeddedFiles   = extractCopiedFiles directives
-      cacheLabels     = buildCacheLabels stageName stageTag embeddedFiles
-      newDockerfile   = toDockerfile $ do
-        embed directives
-        label (Data.Coerce.coerce cacheLabels)
-  liftIO $ print (prettyPrintDockerfile newDockerfile)
+  let
+    fromInstruction = filter isFrom directives
+    sourceImage     = ImageName (extractFullName fromInstruction)
+    cacheEverything = canCacheDirectives directives
+    embeddedFiles =
+      if cacheEverything then extractCopiedFiles directives else []
+
+    cacheLabels   = buildCacheLabels stageName stageTag embeddedFiles
+
+    newDockerfile = toDockerfile $ do
+      if cacheEverything then embed directives else embed fromInstruction
+      label (Data.Coerce.coerce cacheLabels)
+
   doStageBuild app
                sourceImage
                stageImageName
@@ -210,10 +215,12 @@ reBuildAssetStage app uncached cached = do
   printLn ("\n--> Rebuilding asset stage " % s % " at line " % d)
           (stageName cached)
           (stagePos cached)
-  let embeddedFiles = extractCopiedFiles (directives uncached)
-      cacheLabels   = buildCacheLabels (stageName uncached)
-                                       (stageTag uncached)
-                                       embeddedFiles
+  let embeddedFiles = if canCacheDirectives (directives uncached)
+        then extractCopiedFiles (directives uncached)
+        else []
+      cacheLabels = buildCacheLabels (stageName uncached)
+                                     (stageTag uncached)
+                                     embeddedFiles
   let ImageName t   = stageImageName cached
       newDockerfile = cacheableDockerFile t (directives uncached) cacheLabels
   doStageBuild app
@@ -255,7 +262,7 @@ doStageBuild app sourceImageName intermediateImage targetImageName cacheLabels d
     -- Break if previous command failed
     guard (status == ExitSuccess)
 
-    ImageConfig _ onBuildLines <- Docker.Cacher.Inspect.imageConfig
+    ImageConfig _ onBuildLines _ <- Docker.Cacher.Inspect.imageConfig
       sourceImageName
 
     -- Append the ONBUILD lines to the new file
@@ -413,10 +420,10 @@ extractCopiedFiles = concatMap (extractFiles . instruction)
 
 
 buildCacheLabels :: Text -> Text -> [(SourcePath, TargetPath)] -> CacheLabels
-buildCacheLabels imageName imageTag files = CacheLabels
-  [ ("cached_image", imageName <> ":" <> imageTag)
-  , ("cached_files", encodedFiles)
-  ]
+buildCacheLabels imageName imageTag files =
+  CacheLabels $ ("cached_image", imageName <> ":" <> imageTag) : case files of
+    [] -> []
+    _  -> [("cached_files", encodedFiles)]
  where
   encodedFiles = LT.toStrict (Data.Aeson.Text.encodeToLazyText plainTextList)
 
@@ -443,13 +450,13 @@ cacheableDirectives df = if canCacheDirectives df
 
 
 cacheableDockerFile :: Text -> Dockerfile -> CacheLabels -> Dockerfile
-cacheableDockerFile t directives cacheLabels = toDockerfile $ do
+cacheableDockerFile t directives (CacheLabels cacheLabels) = toDockerfile $ do
   -- Use the cached image as base for the new one
   from (toImage t `tagged` "latest")
   -- But we want the contents of the original one
   -- without the ONBUILD
   embed (cacheableDirectives directives)
-  label (Data.Coerce.coerce cacheLabels)
+  label cacheLabels
 
 
 isFrom :: InstructionPos args -> Bool
