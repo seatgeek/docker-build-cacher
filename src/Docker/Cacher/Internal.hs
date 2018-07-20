@@ -3,10 +3,9 @@
 
 module Docker.Cacher.Internal where
 
-import Data.Text (Text)
-import Language.Docker
-import Prelude hiding (FilePath)
-import Turtle
+import           Data.Text                      ( Text )
+import           Language.Docker
+import           Turtle
 
 newtype ImageName a =
     ImageName Text
