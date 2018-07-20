@@ -36,8 +36,8 @@ data StageCache
                     StageCache -- The fallback cache
     | Cached { stage :: Stage CachedImage -- When the image was built and tagged as a separate image
              , cacheBusters :: [(SourcePath, TargetPath)] -- List of files that are able to bust the cache
-              }
-    | CacheInvalidated (Stage CachedImage)
+             }
+    | CacheInvalidated (Stage SourceImage) (Stage CachedImage)
     deriving (Show)
 
 instance Aeson.FromJSON ImageConfig where
@@ -71,7 +71,7 @@ imageConfig (ImageName name) = do
 
 -- | Check whether or not the imageName exists for each of the passed stages
 --   and return only those that already exist.
-getAlreadyCached :: [Stage SourceImage] -> Shell StageCache
+getAlreadyCached :: [Stage SourceImage] -> Shell (Stage SourceImage, StageCache)
 getAlreadyCached stages = do
   echo
     "--> I'm checking whether or not the stage exists as a docker image already"
@@ -83,10 +83,11 @@ getAlreadyCached stages = do
     then do
       echo
         "------> It already exists, so I will then check if the cache files changed"
-      inspectCache stage
+      inspected <- inspectCache stage
+      return (stage, inspected)
     else do
       echo "------> It does not exist, so I will need to build it myself later"
-      maybe (return (NotCached stage))
+      maybe (return (stage, NotCached stage))
             (getFallbackCache stage)
             stageFallbackImage
  where
@@ -121,16 +122,16 @@ getAlreadyCached stages = do
                  , buildImageName = fallbackName
                  }
           )
-        return (FallbackCache stage cachedStage)
+        return (stage, FallbackCache stage cachedStage)
       else do
         echo "------> There is not fallback cache image"
-        return (NotCached stage)
+        return (stage, NotCached stage)
 
 
 -- | Here check each of the cache buster from the image and compare them with those we have locally,
 --   if the files do not match, then we return the stage back as a result, otherwise return Nothing.
-shouldBustCache :: StageCache -> Shell StageCache
-shouldBustCache cached@Cached {..} = do
+shouldBustCache :: Stage SourceImage -> StageCache -> Shell StageCache
+shouldBustCache sourceStage cached@Cached {..} = do
   printLn ("----> Checking cache buster files for stage " % s) (stageName stage)
   withContainer (buildImageName stage) checkFiles -- Create a container to inspect the files
  where
@@ -144,7 +145,7 @@ shouldBustCache cached@Cached {..} = do
     if isJust hasChanged
       then do
         printLn ("----> The stage " % s % " changed") (stageName stage)
-        return (CacheInvalidated stage)
+        return (CacheInvalidated sourceStage stage)
       else do
         printLn ("----> The stage " % s % " did not change") (stageName stage)
         return cached
@@ -169,9 +170,9 @@ shouldBustCache cached@Cached {..} = do
     remote <- liftIO (readTextFile tempFile)
     if local == remote then return Nothing else return (Just file)
 -- In any other case return the same inspected stage
-shouldBustCache c@NotCached{}        = return c
-shouldBustCache c@CacheInvalidated{} = return c
-shouldBustCache c@FallbackCache{}    = return c
+shouldBustCache _ c@NotCached{}        = return c
+shouldBustCache _ c@CacheInvalidated{} = return c
+shouldBustCache _ c@FallbackCache{}    = return c
 
 
 -- | This will inspect how an image was build and extrack the ONBUILD directives. If any of those
@@ -246,7 +247,7 @@ imageAndTagMatches (ImageName imageName) (Tag tagName) cachedImage = do
 alreadyCached :: StageCache -> Maybe (Stage CachedImage)
 -- We want to replace stages where the cache
 -- was invalidated by any file changes.
-alreadyCached (CacheInvalidated stage) = Just stage
+alreadyCached (CacheInvalidated _ stage) = Just stage
 
 -- Likewise, once we have a cached stage, we need to keep using it
 -- in succesive builds, so the cache is not invalidated again.
@@ -254,7 +255,7 @@ alreadyCached (Cached stage _) = Just stage
 
 -- Finally, if we are using a fallback, we apply
 -- the same rules as above for the fallback key
-alreadyCached (FallbackCache _ (CacheInvalidated stage)) = Just stage
+alreadyCached (FallbackCache _ (CacheInvalidated _ stage)) = Just stage
 
 alreadyCached (FallbackCache _ (Cached stage _)) = Just stage
 

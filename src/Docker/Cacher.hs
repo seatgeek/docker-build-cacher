@@ -26,6 +26,9 @@ import           Docker.Cacher.Inspect          ( ImageConfig(..)
                                                 , StageCache(..)
                                                 )
 import           Docker.Cacher.Internal
+import qualified Data.List.NonEmpty
+import qualified Data.Aeson.Text
+import qualified Data.Coerce
 
 {- Glossary:
     - InstructionPos: in the AST for a docker file, each of the lines are described with the type InstructionPos
@@ -102,7 +105,10 @@ cacheBuild app branch fallbackBranch ast = do
   inspectedStages <- getChangedStages app branch fallbackBranch ast
 
   let stagesToBuildFresh = [ stage | NotCached stage <- inspectedStages ]
-  let stagesToReBuild    = [ stage | CacheInvalidated stage <- inspectedStages ]
+  let stagesToReBuild =
+        [ (uncached, stage)
+        | CacheInvalidated uncached stage <- inspectedStages
+        ]
   let stagesToBuildFromFallback =
         [ (uncached, cached)
         | FallbackCache uncached (Cached cached _) <- inspectedStages
@@ -118,7 +124,7 @@ cacheBuild app branch fallbackBranch ast = do
 
   when (stagesToReBuild /= []) $ do
     echo "--> Let's re-build the cache for stages that changed"
-    mapM_ (reBuildAssetStage app) stagesToReBuild -- Build each of the stages so they can be reused later
+    mapM_ (uncurry (reBuildAssetStage app)) stagesToReBuild -- Build each of the stages so they can be reused later
 
 
 -- | Returns a list of stages which needs to either be built separately or that did not have their cached busted
@@ -141,7 +147,7 @@ getChangedStages app branch fallbackBranch ast = do
         -- Find the stages that we already have in local cache
         Docker.Cacher.Inspect.getAlreadyCached stages
         -- Determine whether or not the cache was invalidated
-    >>= Docker.Cacher.Inspect.shouldBustCache
+    >>= uncurry Docker.Cacher.Inspect.shouldBustCache
     )
     Fold.list
  where
@@ -169,20 +175,18 @@ buildAssetStage app Stage {..} = do
     stagePos
   let fromInstruction = filter isFrom directives
       sourceImage     = ImageName (extractFullName fromInstruction)
-      cacheLabels     = [("cached_image", stageName <> ":" <> stageTag)]
+      embeddedFiles   = extractCopiedFiles directives
+      cacheLabels     = buildCacheLabels stageName stageTag embeddedFiles
       newDockerfile   = toDockerfile $ do
         embed directives
-        label cacheLabels
+        label (Data.Coerce.coerce cacheLabels)
   doStageBuild app
                sourceImage
                stageImageName
                buildImageName
-               (CacheLabels cacheLabels)
+               cacheLabels
                newDockerfile
  where
-  isFrom (InstructionPos (From _) _ _) = True
-  isFrom _                             = False
-
   extractFullName (instr : _) = extractFromInstr (instruction instr)
   extractFullName _           = ""
 
@@ -200,36 +204,37 @@ buildAssetStage app Stage {..} = do
 -- | The goal is to create a temporary dockefile in this same folder with the contents
 --   if the stage variable, call docker build with the generated file and tag the image
 --   so we can find it later.
-reBuildAssetStage :: App -> Stage CachedImage -> Shell ()
-reBuildAssetStage app Stage {..} = do
+reBuildAssetStage :: App -> Stage SourceImage -> Stage CachedImage -> Shell ()
+reBuildAssetStage app uncached cached = do
   printLn ("\n--> Rebuilding asset stage " % s % " at line " % d)
-          stageName
-          stagePos
-  let cacheLabels = [("cached_image", stageName <> ":" <> stageTag)]
-  let ImageName t   = stageImageName
-      newDockerfile = toDockerfile $ do
-        from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
-        label cacheLabels
+          (stageName cached)
+          (stagePos cached)
+  let embeddedFiles = extractCopiedFiles (directives uncached)
+      cacheLabels   = buildCacheLabels (stageName uncached)
+                                       (stageTag uncached)
+                                       embeddedFiles
+  let ImageName t   = stageImageName cached
+      newDockerfile = cacheableDockerFile t (directives uncached) cacheLabels
   doStageBuild app
-               buildImageName -- The source image is the one having the ONBUILD lines
-               stageImageName
-               buildImageName
-               (CacheLabels cacheLabels)
+               (buildImageName cached) -- The source image is the one having the ONBUILD lines
+               (stageImageName cached)
+               (buildImageName cached)
+               cacheLabels
                newDockerfile
+
 
 reBuildFromFallback :: App -> Stage SourceImage -> Stage CachedImage -> Shell ()
 reBuildFromFallback app uncached cached = do
-  let cacheLabels =
-        [("cached_image", stageName uncached <> ":" <> stageTag uncached)]
+  let embeddedFiles = extractCopiedFiles (directives uncached)
+      cacheLabels =
+        buildCacheLabels (stageName uncached) (stageTag uncached) embeddedFiles
   let sourceImage@(ImageName t) = buildImageName cached
-      newDockerfile             = toDockerfile $ do
-        from $ toImage t `tagged` "latest" -- Use the cached image as base for the new one
-        label cacheLabels
+      newDockerfile = cacheableDockerFile t (directives uncached) cacheLabels
   doStageBuild app
                sourceImage
                (stageImageName uncached)
                (buildImageName uncached)
-               (CacheLabels cacheLabels)
+               cacheLabels
                newDockerfile
 
 
@@ -369,7 +374,9 @@ replaceStages stages = fmap
   )
  where
   stagesMap = Map.fromList (map createStagePairs stages)
+
   createStagePairs stage@Stage {..} = (stageAlias, stage)
+
   --
   -- | Find whehter or not we have extracted a stage with the same alias
   --   If we did, then replace the FROM directive with our own version
@@ -390,6 +397,54 @@ replaceStages stages = fmap
 
   formatAlias = Just . fromString . Text.unpack
 
+
+-- | Finds all COPY and ADD instructions in the dockerfile and returns
+-- a concatenated list of all the source paths collected
+extractCopiedFiles :: Dockerfile -> [(SourcePath, TargetPath)]
+extractCopiedFiles = concatMap (extractFiles . instruction)
+ where
+  extractFiles (Copy CopyArgs { sourcePaths, sourceFlag = NoSource, targetPath })
+    = zip (Data.List.NonEmpty.toList sourcePaths) (repeat targetPath)
+  extractFiles (Copy CopyArgs { sourceFlag = _ }) = []
+  extractFiles (Add AddArgs { sourcePaths, targetPath }) =
+    zip (Data.List.NonEmpty.toList sourcePaths) (repeat targetPath)
+  extractFiles _ = []
+
+
+buildCacheLabels :: Text -> Text -> [(SourcePath, TargetPath)] -> CacheLabels
+buildCacheLabels imageName imageTag files = CacheLabels
+  [ ("cached_image", imageName <> ":" <> imageTag)
+  , ("cached_files", encodedFiles)
+  ]
+ where
+  encodedFiles = LT.toStrict (Data.Aeson.Text.encodeToLazyText plainTextList)
+
+  plainTextList :: [(Text, Text)]
+  plainTextList = Data.Coerce.coerce files
+
+
+cacheableDirectives :: Dockerfile -> Dockerfile
+cacheableDirectives = filter (not . isFrom) . filter (not . isOnBuild)
+
+
+cacheableDockerFile :: Text -> Dockerfile -> CacheLabels -> Dockerfile
+cacheableDockerFile t directives cacheLabels = toDockerfile $ do
+  -- Use the cached image as base for the new one
+  from (toImage t `tagged` "latest")
+  -- But we want the contents of the original one
+  -- without the ONBUILD
+  embed (cacheableDirectives directives)
+  label (Data.Coerce.coerce cacheLabels)
+
+
+isFrom :: InstructionPos args -> Bool
+isFrom (InstructionPos From{} _ _) = True
+isFrom _                           = False
+
+
+isOnBuild :: InstructionPos args -> Bool
+isOnBuild (InstructionPos OnBuild{} _ _) = True
+isOnBuild _                              = False
 
 toImage :: Text -> Image
 toImage = fromString . Text.unpack
