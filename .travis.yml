@@ -1,87 +1,72 @@
-# Build starts faster without `sudo`
 sudo: false
-
 language: c
 compiler: gcc
-
 cache:
   directories:
-  - $HOME/.stack
+  - "$HOME/.stack"
   timeout: 300
-
-# Increase depth (from default 50) to preserve version from `git describe`
 git:
   depth: 100
-
 matrix:
   include:
-    - env: &lts-fixed ARGS="--resolver lts-12.8"
-      dist: xenial
-      addons:
-        artifacts: {paths: [./releases]}
-      before_deploy:
-        # Show dynamic libraries `docker-build-cacher` depends on
-        - ldd $(which docker-build-cacher) || true
-        - curl -sSL https://github.com/upx/upx/releases/download/v3.94/upx-3.94-amd64_linux.tar.xz
-          | tar -x --xz --strip-components=1 -C ~/.local/bin upx-3.94-amd64_linux/upx
-        # Compress binary
-        - upx -q --best --ultra-brute "./releases/${BINARY_NAME}"
-      deploy: &release_deploy
-        provider: releases
-        api_key:
-          secure: bAcEdQB7Hk4yDz58u5oo8aEoitbbobaqW7Dr58asJHnm0KG3g1lJqCrgRP2ldbmG8I9zj1osfw0qGCNc3MZW2sV5AaWqxUGC1Sw2jmz0fqdajk8f0bZXZMECFeryPeXmPRftw0VAKz5dVw5wzjunaAVUEuCC3B4a80v/3+Qj8t2FaslG+uNoTTEEzHPfwgowYPQf+QR1Ob3lWM41g0ORC9mgYAD/PIUi8mnxCVRExUecHwhTM1A8UMo/MDVQuv3cclJ+Xc10O9KTCr7tf9uh4g2ZY4RD/aW5zuUt1tqMVJfcL/BQi5wOrhJd0jwMW8LZg0eBypezXZ70CC1Eb+vwe7OUrDlUroyzPUsOXd7u6LAWe+dBE0zNwvWXFnUF6ls8cJDhrVoSmVV3SFd208/xmemDgMmtBWwcjxyCM3kMyCBx1T6nkXQ4czS5Nvn1dav87sgyowR52W52oiyomJyJtBrmrlP/2qgNAJgQuzah/ltuBBvyGCaiwFQFHzUjUNv/ENCNP06aEVTLdbkLXLNfvlw6NZbn8KIOGFmSncLT3hNtcRhS6XnrCIyOc6hYelzVLXPNhmWFo7Ob3/1GFSvlWVmzHEp5+AeTYAQmsAZMAe/E5ofVSrU/3DhXvxMjzdOq5bZ9FsOMfooxYIPp05kVsW4H6dB8kIUqQcWTntt4ys4=
-        file: "./releases/${BINARY_NAME}"
-        skip_cleanup: true
-        draft: true
-        tag_name: "${TRAVIS_TAG}"
-        on:
-          tags: true
-
-    - env: *lts-fixed
-      addons:
-        artifacts: {paths: [./releases]}
-      before_deploy:
-        # Show dynamic libraries `docker-build-cacher` depends on
-        - otool -L $(which docker-build-cacher) || true
-        - brew update > /dev/null
-        - brew install upx
-        # Compress binary
-        - upx -q --best --ultra-brute "./releases/${BINARY_NAME}"
-      deploy:
-        <<: *release_deploy
-      os: osx
-
+  - env: ARGS="--resolver lts-12.8"
+    dist: xenial
+    before_deploy:
+    - ldd $(which docker-build-cacher) || true
+    - curl -sSL https://github.com/upx/upx/releases/download/v3.94/upx-3.94-amd64_linux.tar.xz
+      | tar -x --xz --strip-components=1 -C ~/.local/bin upx-3.94-amd64_linux/upx
+    - upx -q --best --ultra-brute "./releases/${BINARY_NAME}"
+    deploy:
+      provider: releases
+      api_key: &1
+        secure: bAcEdQB7Hk4yDz58u5oo8aEoitbbobaqW7Dr58asJHnm0KG3g1lJqCrgRP2ldbmG8I9zj1osfw0qGCNc3MZW2sV5AaWqxUGC1Sw2jmz0fqdajk8f0bZXZMECFeryPeXmPRftw0VAKz5dVw5wzjunaAVUEuCC3B4a80v/3+Qj8t2FaslG+uNoTTEEzHPfwgowYPQf+QR1Ob3lWM41g0ORC9mgYAD/PIUi8mnxCVRExUecHwhTM1A8UMo/MDVQuv3cclJ+Xc10O9KTCr7tf9uh4g2ZY4RD/aW5zuUt1tqMVJfcL/BQi5wOrhJd0jwMW8LZg0eBypezXZ70CC1Eb+vwe7OUrDlUroyzPUsOXd7u6LAWe+dBE0zNwvWXFnUF6ls8cJDhrVoSmVV3SFd208/xmemDgMmtBWwcjxyCM3kMyCBx1T6nkXQ4czS5Nvn1dav87sgyowR52W52oiyomJyJtBrmrlP/2qgNAJgQuzah/ltuBBvyGCaiwFQFHzUjUNv/ENCNP06aEVTLdbkLXLNfvlw6NZbn8KIOGFmSncLT3hNtcRhS6XnrCIyOc6hYelzVLXPNhmWFo7Ob3/1GFSvlWVmzHEp5+AeTYAQmsAZMAe/E5ofVSrU/3DhXvxMjzdOq5bZ9FsOMfooxYIPp05kVsW4H6dB8kIUqQcWTntt4ys4=
+      file: "./releases/${BINARY_NAME}"
+      skip_cleanup: true
+      draft: true
+      tag_name: "${TRAVIS_TAG}"
+      on: &2
+        tags: true
+  - env: ARGS="--resolver lts-12.8"
+    before_deploy:
+    - otool -L $(which docker-build-cacher) || true
+    - brew update > /dev/null
+    - brew install upx
+    - upx -q --best --ultra-brute "./releases/${BINARY_NAME}"
+    deploy:
+      provider: releases
+      api_key: *1
+      file: "./releases/${BINARY_NAME}"
+      skip_cleanup: true
+      draft: true
+      tag_name: "${TRAVIS_TAG}"
+      on: *2
+    os: osx
 before_install:
-  - export BINARY_NAME="docker-build-cacher-(uname -s)-$(uname -m)"
-  # Download and unpack the stack executable
-  - mkdir -p ~/.local/bin
-  - |
-    if [[ "${TRAVIS_OS_NAME}" = "osx" ]]
-    then
-      travis_retry curl -sSL https://www.stackage.org/stack/${TRAVIS_OS_NAME}-x86_64 \
-        | tar xz --strip-components=1 -C ~/.local/bin --include   '*/stack'
-    else
-      travis_retry curl -sSL https://www.stackage.org/stack/${TRAVIS_OS_NAME}-x86_64 \
-        | tar xz --strip-components=1 -C ~/.local/bin --wildcards '*/stack'
-    fi
-
+- export BINARY_NAME="docker-build-cacher-$(uname -s)-$(uname -m)"
+- mkdir -p ~/.local/bin
+- |
+  if [[ "${TRAVIS_OS_NAME}" = "osx" ]]
+  then
+    travis_retry curl -sSL https://www.stackage.org/stack/${TRAVIS_OS_NAME}-x86_64 \
+      | tar xz --strip-components=1 -C ~/.local/bin --include   '*/stack'
+  else
+    travis_retry curl -sSL https://www.stackage.org/stack/${TRAVIS_OS_NAME}-x86_64 \
+      | tar xz --strip-components=1 -C ~/.local/bin --wildcards '*/stack'
+  fi
 install:
-  - travis_retry stack --no-terminal --install-ghc $ARGS test --only-dependencies
-  - stack --no-terminal $ARGS install --ghc-options='-fPIC'
-
+- travis_retry stack --no-terminal --install-ghc $ARGS test --only-dependencies
+- stack --no-terminal $ARGS install --ghc-options='-fPIC'
 script:
-  - docker-build-cacher -h
-
+- docker-build-cacher -h
 after_success:
-  - mkdir -p ./releases/
-  - cp "$(which docker-build-cacher)" "./releases/${BINARY_NAME}"
-
+- mkdir -p ./releases/
+- cp "$(which docker-build-cacher)" "./releases/${BINARY_NAME}"
 deploy:
   provider: releases
-  api_key:
-    secure: MqW/mOKzbWza3awdTZSPZ7ALn4ifOGyPIuSvzojGkp9qoEKm/omKkSWCqsQXoVeYrZJ+jaIIjV6TBCVsr5hhTRgZyZ3a5BEnqW9N65yCBC+iLWflFdPUcHRuRz8A33xtf53ecFk5QZAw61UZoN6yIGwyYpx4Kj6WC3wvOQu5BsnSnrJQ50GjwjizBTa9y/cXQZoGwD3MGc7N3rc5AVdhq2SUg7xrVk5A/3cQ6I5N8lj9NEzrkQBN3AZN3apQ1DhYEMKo9CKHvDw2dCtjzTkC6xadLVQa2NFv2RfK/04G6ta6LUUGANpYxjc+g0lUrbE1weJ7Z1rqJTWqI+k3bpY2y6eAq7kq3SaenAGk2G/UFP6NAj6DEat9+hjaDOe9HGoXiKsmDYyHQ5Gy/ErhLwB4emL05Sg2Ctdcl1mqyOiXb3cARSdg3Q8Wccom7GqyUFX6EGfrgMMi8e6odGDvkSesGazgeN9HHAefwiTzv83JTsvDc2okcS4qMh4KcFD7bwrlP8PejUQOBYEpXNFRK7OHWP8fKWslkNtuH651fjG57p1so5mIIJSZHfPb7GVD25s2le5DxSCF02GwZQcS8i+gFhvLDnf1hHimyKB38oTz+kbrKnlz+pWoUddxkA54fJkHE7F/0YMljcIOjOgL2glKJ9JIA3krrzvkcpUNnsuBfqE=
-  file: "./releases/${BINARY_NAME}"
+  draft: true
   skip_cleanup: true
+  api_key:
+    secure: LVHejAg6bPwFsTX73ysIwfbRMjpxs2JnDvV9OykBhGL4XmRtz4LDiT0Gr+j5X6fZLoorq4MHGBCSfujhnq5GZ/R1Tnr6FuQlTqqCNMd1bWueRWZDfTY3ZLfxz/uc8REmYuYF474HyFD4SeWLrMyhciTP4OhZr7PPoMguDkKkOTZWWRlcj30oqc3bVgbrGCz2WgLyFNrmuFkzMbCVGn2UmEJvW9i3EApXj6DqiLszux1OI8MHHdsdMijE+dIsXxtlwOJPSQOLfpirR3H7R5RJtXV65O/QgvXvcLvlBT6j6SoGe8q/aAvSvfLD8316cAHyOuSay9tLbUB1NlhqD/kI6pvxJldIDVjKHzCZ89+GYK2/t493JDNSqBG6SS5WLtfDYeX7eebUE0AN3ga/oZmWKUUtqtjVBOqC+qz3Ogo9LeAotuEZ/jNPI21ZrNdi1tNVokpWFVv/wCRRsTg7g4pIcbpFmxgRvMeJdcVzR+AOUH3r8Ah0jkV5tG6cfMrrcWwmIjUPReTq698TWQrOTEND7fCRHFrlRHRqRU0BmGwz3uEhFP59JCoAJUlrI89eGmok4U6q339Kdi/kZ0lvaBTkuezbgSz9uiNKma42V80D3Rz6ig7S47E39uXy1iquwp/8Z8XH0zEnmobpSWgUUd2FXEYJmmLb/6ChcYMldNPBq/4=
+  file: "./releases/${BINARY_NAME}"
   on:
-    repo: seatgeek/docker-build-cacher
     tags: true
