@@ -137,7 +137,13 @@ getAlreadyCached stages = do
 shouldBustCache :: Stage SourceImage -> StageCache -> Shell StageCache
 shouldBustCache sourceStage cached@Cached {..} = do
   printLn ("----> Checking cache buster files for stage " % s) (stageName stage)
-  withContainer (buildImageName stage) checkFiles -- Create a container to inspect the files
+  result <- withContainer (buildImageName stage) checkFiles -- Create a container to inspect the files
+  case result of
+    Left _ -> do
+      err
+        "----> Could not create the container, impossible to inspect the cache"
+      return $ NotCached sourceStage
+    Right stCache -> return stCache
  where
   checkFiles containerId = do
     hasChanged <- fold
@@ -163,7 +169,10 @@ shouldBustCache sourceStage cached@Cached {..} = do
     if isDirectory fileStat
       then do
         printLn
-          ("------>'" % fp % "' is a directory, assuming files inside it changed")
+          ( "------>'"
+          % fp
+          % "' is a directory, assuming files inside it changed"
+          )
           file
         return $ Just file
       else do
@@ -297,12 +306,15 @@ alreadyCached _ = Nothing
 
 -- | Creates a container from a stage and passes the container id to the
 --   given shell as an argument
-withContainer :: ImageName a -> (Text -> Shell b) -> Shell b
+withContainer :: ImageName a -> (Text -> Shell b) -> Shell (Either Line b)
 withContainer (ImageName imageName) action = do
-  containerId <- inproc "docker" ["create", imageName] empty
-  result      <- fold (action (format l containerId)) Fold.list
-  _           <- removeContainer containerId -- Ignore the return code of this command
-  select result -- yield each result as a separate line
+  result <- inprocWithErr "docker" ["create", imageName, "sh"] empty
+  case result of
+    Left  errorMsg    -> return (Left errorMsg)
+    Right containerId -> do
+      res <- fold (action (format l containerId)) Fold.list
+      _   <- removeContainer containerId -- Ignore the return code of this command
+      select (map Right res) -- yield each result as a separate line
  where
   removeContainer containerId =
     proc "docker" ["rm", format l containerId] empty

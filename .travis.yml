@@ -65,8 +65,7 @@ deploy:
   provider: releases
   draft: true
   skip_cleanup: true
-  api_key:
-    secure: LVHejAg6bPwFsTX73ysIwfbRMjpxs2JnDvV9OykBhGL4XmRtz4LDiT0Gr+j5X6fZLoorq4MHGBCSfujhnq5GZ/R1Tnr6FuQlTqqCNMd1bWueRWZDfTY3ZLfxz/uc8REmYuYF474HyFD4SeWLrMyhciTP4OhZr7PPoMguDkKkOTZWWRlcj30oqc3bVgbrGCz2WgLyFNrmuFkzMbCVGn2UmEJvW9i3EApXj6DqiLszux1OI8MHHdsdMijE+dIsXxtlwOJPSQOLfpirR3H7R5RJtXV65O/QgvXvcLvlBT6j6SoGe8q/aAvSvfLD8316cAHyOuSay9tLbUB1NlhqD/kI6pvxJldIDVjKHzCZ89+GYK2/t493JDNSqBG6SS5WLtfDYeX7eebUE0AN3ga/oZmWKUUtqtjVBOqC+qz3Ogo9LeAotuEZ/jNPI21ZrNdi1tNVokpWFVv/wCRRsTg7g4pIcbpFmxgRvMeJdcVzR+AOUH3r8Ah0jkV5tG6cfMrrcWwmIjUPReTq698TWQrOTEND7fCRHFrlRHRqRU0BmGwz3uEhFP59JCoAJUlrI89eGmok4U6q339Kdi/kZ0lvaBTkuezbgSz9uiNKma42V80D3Rz6ig7S47E39uXy1iquwp/8Z8XH0zEnmobpSWgUUd2FXEYJmmLb/6ChcYMldNPBq/4=
+  api_key: $GITHUB_OAUTH_TOKEN
   file: "./releases/${BINARY_NAME}"
   on:
     tags: true
