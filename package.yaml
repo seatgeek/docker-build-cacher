@@ -1,6 +1,6 @@
 name: docker-build-cacher
-version: '2.1.0'
-synopsis: Builds a services with docker and caches all of its intermediate stages
+version: '2.1.1'
+synopsis: Builds a docker image and caches all of its intermediate stages
 description: A CLI tool to speed up multi-stage docker file builds by caching intermediate
 category: Operations
 author:
