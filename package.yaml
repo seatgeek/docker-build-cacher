@@ -42,3 +42,9 @@ executables:
     - -with-rtsopts=-N
     - -Wall
     - -fno-warn-unused-do-bind
+    when:
+    # OS X does not support static build https://developer.apple.com/library/content/qa/qa1118
+    - condition: '!(os(osx))'
+      ld-options:
+        - -static
+        - -pthread
