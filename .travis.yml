@@ -75,3 +75,13 @@ script:
 after_success:
   - mkdir -p ./releases/
   - cp "$(which docker-build-cacher)" "./releases/${BINARY_NAME}"
+
+deploy:
+  provider: releases
+  api_key:
+    secure: MqW/mOKzbWza3awdTZSPZ7ALn4ifOGyPIuSvzojGkp9qoEKm/omKkSWCqsQXoVeYrZJ+jaIIjV6TBCVsr5hhTRgZyZ3a5BEnqW9N65yCBC+iLWflFdPUcHRuRz8A33xtf53ecFk5QZAw61UZoN6yIGwyYpx4Kj6WC3wvOQu5BsnSnrJQ50GjwjizBTa9y/cXQZoGwD3MGc7N3rc5AVdhq2SUg7xrVk5A/3cQ6I5N8lj9NEzrkQBN3AZN3apQ1DhYEMKo9CKHvDw2dCtjzTkC6xadLVQa2NFv2RfK/04G6ta6LUUGANpYxjc+g0lUrbE1weJ7Z1rqJTWqI+k3bpY2y6eAq7kq3SaenAGk2G/UFP6NAj6DEat9+hjaDOe9HGoXiKsmDYyHQ5Gy/ErhLwB4emL05Sg2Ctdcl1mqyOiXb3cARSdg3Q8Wccom7GqyUFX6EGfrgMMi8e6odGDvkSesGazgeN9HHAefwiTzv83JTsvDc2okcS4qMh4KcFD7bwrlP8PejUQOBYEpXNFRK7OHWP8fKWslkNtuH651fjG57p1so5mIIJSZHfPb7GVD25s2le5DxSCF02GwZQcS8i+gFhvLDnf1hHimyKB38oTz+kbrKnlz+pWoUddxkA54fJkHE7F/0YMljcIOjOgL2glKJ9JIA3krrzvkcpUNnsuBfqE=
+  file: "./releases/${BINARY_NAME}"
+  skip_cleanup: true
+  on:
+    repo: seatgeek/docker-build-cacher
+    tags: true
