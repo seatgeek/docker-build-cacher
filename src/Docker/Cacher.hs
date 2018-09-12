@@ -468,5 +468,6 @@ isOnBuild :: InstructionPos args -> Bool
 isOnBuild (InstructionPos OnBuild{} _ _) = True
 isOnBuild _                              = False
 
+
 toImage :: Text -> Image
 toImage = fromString . Text.unpack
