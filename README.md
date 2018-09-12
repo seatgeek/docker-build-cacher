@@ -70,6 +70,17 @@ The effect it has should be obvious: your builds will be consistently fast, at t
 There are binaries provided for `linux-x86_64` and MacOS, check
 [the releases page](https://github.com/seatgeek/docker-build-cacher/releases) for downloads.
 
+## How It Works
+
+This works by parsing the Dockerfile and extracting the `COPY` or `ADD` instructions nested inside `ONBUILD` for each of
+the stages found in the file.
+
+It will compare the source files present in such `COPY` or `ADD` instructions to check for changes. If it can detect changes,
+it rewrites your Dockerfile on the fly so that the `FROM` directives in each of the stages use the locally cached images instead
+of the original base image.
+
+The effect this `FROM` swap has, is that disk state for the image is preserved between builds.
+
 ## Usage
 
 `docker-build-cacher` requires the following environment variables to be present in order to correctly build
@@ -127,16 +138,62 @@ docker-build-cacher cache
 
 The above will make the cached image for the `my-feature` branch to be based on the one from the `master` branch.
 
-## How It Works
+### Caching Intermediate Images
 
-This works by parsing the Dockerfile and extracting the `COPY` or `ADD` instructions nested inside `ONBUILD` for each of
-the stages found in the file.
+In some circumstances, you may want to execute additional instructions after
+including the base builder image. For instance, building an executable or
+bundle using all the dependencies already downloaded:
 
-It will compare the source files present in such `COPY` or `ADD` instructions to check for changes. If it can detect changes,
-it rewrites your Dockerfile on the fly so that the `FROM` directives in each of the stages use the locally cached images instead
-of the original base image.
+```Dockerfile
+# Automatically build haskell stack dependencies
+FROM haskell-stack as builder
 
-The effect this `FROM` swap has, is that disk state for the image is preserved between builds.
+COPY . .
+RUN stack install
+
+# Build the final container image
+FROM scratch
+
+COPY --from=builder /root/.local/bin/my-app
+```
+
+This very typical example has a shortcoming now, each time we do `COPY . .` we
+are also invalidating the compiling artifacts created in `stack install`, that
+is, we are losing the benefits of incremental compilation.
+
+If you want to keep incremental compilation, or any files generated in between
+the builder image and the final `FROM`, you can label the intermediate image so
+that `docker-build-cacher` will include that into the cached artifacts:
+
+```Dockerfile
+# Automatically build haskell stack dependencies
+FROM haskell-stack as builder
+
+# Instructs the cacher to also copy the files generated in this stage
+LABEL cache_instructions=cache
+
+COPY . .
+RUN stack install
+
+# Build the final container image
+FROM scratch
+
+COPY --from=builder /root/.local/bin/my-app
+```
+
+**Warning:**
+
+The files copied in `COPY . .` will also be cached! This not only increases the
+cache size, but also has a potentially dangerous inconvenient:
+
+Any files you delete from one build to the other will be restored again by the
+cacher. For example, if you delete one file in your source tree because you
+don't use it anymore or you did a refactoring, it will pop up again in the build!
+
+This may be a problem for compilers or build tools that scan all the files in
+the folder, like the Go compiler. If you are certain that keeping old files
+around is not a problem, then it is safe to use this feature. The Haskell
+compiler, for instance, does not care at all about extra cruft in the folder.
 
 ## Passing extra arguments to docker build
 
