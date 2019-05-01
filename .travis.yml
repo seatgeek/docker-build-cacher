@@ -9,20 +9,18 @@ git:
   depth: 100
 matrix:
   include:
-  - env: ARGS="--resolver lts-12.8"
-    dist: xenial
+  - dist: xenial
     before_deploy:
     - ldd $(which docker-build-cacher) || true
     - curl -sSL https://github.com/upx/upx/releases/download/v3.94/upx-3.94-amd64_linux.tar.xz
       | tar -x --xz --strip-components=1 -C ~/.local/bin upx-3.94-amd64_linux/upx
     - upx -q --best --ultra-brute "./releases/${BINARY_NAME}"
-  - env: ARGS="--resolver lts-12.8"
+  - os: osx
     before_deploy:
     - otool -L $(which docker-build-cacher) || true
     - brew update > /dev/null
     - brew install upx
     - upx -q --best --ultra-brute "./releases/${BINARY_NAME}"
-    os: osx
 before_install:
 - export BINARY_NAME="docker-build-cacher-$(uname -s)-$(uname -m)"
 - mkdir -p ~/.local/bin
@@ -36,8 +34,8 @@ before_install:
       | tar xz --strip-components=1 -C ~/.local/bin --wildcards '*/stack'
   fi
 install:
-- travis_retry stack --no-terminal --install-ghc $ARGS test --only-dependencies
-- stack --no-terminal $ARGS install --ghc-options='-fPIC'
+- travis_retry stack --no-terminal --install-ghc test --only-dependencies
+- stack --no-terminal install --ghc-options='-fPIC'
 script:
 - docker-build-cacher -h
 after_success:
