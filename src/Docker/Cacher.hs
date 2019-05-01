@@ -196,15 +196,14 @@ buildAssetStage app Stage {..} = do
   extractFullName (instr : _) = extractFromInstr (instruction instr)
   extractFullName _           = ""
 
-  extractFromInstr (From (DigestedImage img digest _)) =
-    prettyImage img <> "@" <> digest
-  extractFromInstr (From (UntaggedImage img _)) = prettyImage img
-  extractFromInstr (From (TaggedImage img (Tag tag) _)) =
-    prettyImage img <> ":" <> tag
+  extractFromInstr (From BaseImage { image, tag }) =
+    prettyImage image <> prettyTag tag
   extractFromInstr _ = ""
 
   prettyImage (Image Nothing               img) = img
   prettyImage (Image (Just (Registry reg)) img) = reg <> "/" <> img
+
+  prettyTag = maybe "" (\(Tag t) -> ":" <> t)
 
 
 -- | The goal is to create a temporary dockefile in this same folder with the contents
@@ -351,7 +350,7 @@ toStage (App app) branch fallback directives = do
       buildImageName = ImageName (newImageName branch <> "-build")
       stageFallbackImage =
         fmap (\br -> ImageName (newImageName br <> "-build")) fallback
-  return Stage {..}
+  return Stage { .. }
  where
   extractInfo :: Dockerfile -> Maybe (Text, Text, Linenumber, Text)
   extractInfo (InstructionPos { instruction, lineNumber } : _) =
@@ -360,12 +359,10 @@ toStage (App app) branch fallback directives = do
 
   getStageInfo
     :: Instruction Text -> Linenumber -> Maybe (Text, Text, Linenumber, Text)
-  getStageInfo (From (TaggedImage Image { imageName } (Tag tag) (Just (ImageAlias alias)))) pos
-    = Just (imageName, tag, pos, alias)
-  getStageInfo (From (UntaggedImage Image { imageName } (Just (ImageAlias alias)))) pos
-    = Just (imageName, "latest", pos, alias)
-  getStageInfo (From (DigestedImage Image { imageName } tag (Just (ImageAlias alias)))) pos
-    = Just (imageName, tag, pos, alias)
+  getStageInfo (From BaseImage { image, tag = Just (Tag tag), alias = Just (ImageAlias alias) }) pos
+    = Just (imageName image, tag, pos, alias)
+  getStageInfo (From BaseImage { image, tag = Nothing, alias = Just (ImageAlias alias) }) pos
+    = Just (imageName image, "latest", pos, alias)
   getStageInfo _ _ = Nothing
 
   --
@@ -378,7 +375,7 @@ toStage (App app) branch fallback directives = do
 replaceStages :: [Stage CachedImage] -> Dockerfile -> Dockerfile
 replaceStages stages = fmap
   (\InstructionPos {..} ->
-    InstructionPos {instruction = replaceStage instruction, ..}
+    InstructionPos { instruction = replaceStage instruction, .. }
   )
  where
   stagesMap = Map.fromList (map createStagePairs stages)
@@ -388,11 +385,7 @@ replaceStages stages = fmap
   --
   -- | Find whehter or not we have extracted a stage with the same alias
   --   If we did, then replace the FROM directive with our own version
-  replaceStage directive@(From (TaggedImage _ _ (Just (ImageAlias imageAlias))))
-    = replaceKnownAlias directive imageAlias
-  replaceStage directive@(From (UntaggedImage _ (Just (ImageAlias imageAlias))))
-    = replaceKnownAlias directive imageAlias
-  replaceStage directive@(From (DigestedImage _ _ (Just (ImageAlias imageAlias))))
+  replaceStage directive@(From BaseImage { alias = Just (ImageAlias imageAlias) })
     = replaceKnownAlias directive imageAlias
   replaceStage directive = directive
 
@@ -401,7 +394,14 @@ replaceStages stages = fmap
       Nothing -> directive
       Just Stage { buildImageName, stageAlias } ->
         let ImageName t = buildImageName
-        in  From (TaggedImage (toImage t) "latest" (formatAlias stageAlias))
+        in  From
+              (BaseImage { image    = toImage t
+                         , tag      = Just "latest"
+                         , alias    = formatAlias stageAlias
+                         , digest   = Nothing
+                         , platform = Nothing
+                         }
+              )
 
   formatAlias = Just . fromString . Text.unpack
 

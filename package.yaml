@@ -17,7 +17,7 @@ extra-source-files:
 dependencies:
   - base >=4.9.1.0 && <5
   - turtle
-  - language-docker >= 6.0.4 && < 7.0
+  - language-docker >= 8.0.2 && < 9
   - containers
   - foldl
   - text

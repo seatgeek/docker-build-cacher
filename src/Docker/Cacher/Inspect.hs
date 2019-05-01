@@ -164,38 +164,43 @@ shouldBustCache sourceStage cached@Cached {..} = do
   checkFileChanged containerId files = do
     (SourcePath src, TargetPath dest) <- select files
     let file = fromText src
-    fileStat <- stat file
+    exists <- testpath file
+    if not exists
+    then
+      return (Just file)
+    else do
+      isDir <- testdir file
 
-    if isDirectory fileStat
-      then do
-        printLn
-          ( "------>'"
-          % fp
-          % "' is a directory, assuming files inside it changed"
-          )
-          file
-        return $ Just file
-      else do
-        let targetDir = fromText dest
-        printLn ("------> Checking file '" % fp % "' in directory " % fp)
-                file
-                targetDir
-        currentDirectory <- pwd
-        tempFile         <- mktempfile currentDirectory "comp"
-        let targetFile = targetDir </> file
-        status <- proc
-          "docker"
-          [ "cp"
-          , format (s % ":" % fp) containerId targetFile
-          , format fp tempFile
-          ]
-          empty
+      if isDir
+        then do
+          printLn
+            ( "------>'"
+            % fp
+            % "' is a directory, assuming files inside it changed"
+            )
+            file
+          return $ Just file
+        else do
+          let targetDir = fromText dest
+          printLn ("------> Checking file '" % fp % "' in directory " % fp)
+                  file
+                  targetDir
+          currentDirectory <- pwd
+          tempFile         <- mktempfile currentDirectory "comp"
+          let targetFile = targetDir </> file
+          status <- proc
+            "docker"
+            [ "cp"
+            , format (s % ":" % fp) containerId targetFile
+            , format fp tempFile
+            ]
+            empty
 
-        guard (status == ExitSuccess)
+          guard (status == ExitSuccess)
 
-        local  <- liftIO (readTextFile file)
-        remote <- liftIO (readTextFile tempFile)
-        if local == remote then return Nothing else return (Just file)
+          local  <- liftIO (readTextFile file)
+          remote <- liftIO (readTextFile tempFile)
+          if local == remote then return Nothing else return (Just file)
 
 -- In any other case return the same inspected stage
 shouldBustCache _ c@NotCached{}        = return c
